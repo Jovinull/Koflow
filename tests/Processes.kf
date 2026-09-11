@@ -1,0 +1,80 @@
+import koflow.JobStore
+
+void runProcessCase(String action) {
+    var store = JobStore(config.env("TEST_DB"))
+    if (action == "seed") {
+        println(store.enqueue("process", "persistido em outro processo", 3))
+    } else if (action == "hold") {
+        holdClaim(store)
+    } else if (action == "recover") {
+        recoverClaim(store)
+    } else if (action == "race") {
+        raceClaim(store)
+    } else if (action == "verify-race") {
+        verifyRace()
+    } else if (action == "uncommitted") {
+        holdUncommitted()
+    } else if (action == "verify-rollback") {
+        assert(store.claim("process", time.now(), 1000L).size == 0)
+        println("PASS escrita não confirmada revertida após SIGKILL")
+    } else {
+        throw "Caso de processo desconhecido"
+    }
+}
+
+void holdClaim(JobStore store) {
+    var job = store.claim("process", time.now(), 2000L).get(0)
+    assert(job.attempts == 1)
+    println("CLAIMED " + job.id)
+    while (true) {
+        time.sleep(100)
+    }
+}
+
+void recoverClaim(JobStore store) {
+    var deadline = time.now() + 10000L
+    var recovered = false
+    while (!recovered && time.now() < deadline) {
+        var rows = store.claim("process", time.now(), 60000L)
+        if (rows.size > 0) {
+            var job = rows.get(0)
+            assert(job.attempts == 2)
+            assert(job.payload == "persistido em outro processo")
+            assert(store.succeed(job, time.now()))
+            println("RECOVERED " + job.id)
+            recovered = true
+        } else {
+            time.sleep(20)
+        }
+    }
+    assert(recovered, "recovery não ocorreu no prazo")
+}
+
+void raceClaim(JobStore store) {
+    var rows = store.claim("process", time.now(), 60000L)
+    if (rows.size > 0) {
+        assert(rows.get(0).attempts == 1)
+        println("WON")
+    } else {
+        println("EMPTY")
+    }
+}
+
+void verifyRace() {
+    var conn = db.connect("jdbc:sqlite:" + config.env("TEST_DB"))
+    var rows = db.query<koflow.Job>(conn, "SELECT * FROM jobs")
+    assert(rows.size == 1)
+    assert(rows.get(0).status == "running")
+    assert(rows.get(0).attempts == 1)
+    db.close(conn)
+}
+
+void holdUncommitted() {
+    var conn = db.connect("jdbc:sqlite:" + config.env("TEST_DB"))
+    db.execute(conn, "BEGIN IMMEDIATE")
+    db.execute(conn, "INSERT INTO jobs(id,kind,payload,max_attempts) VALUES ('uncommitted','process','partial',1)")
+    println("UNCOMMITTED")
+    while (true) {
+        time.sleep(100)
+    }
+}

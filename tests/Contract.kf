@@ -1,0 +1,227 @@
+import koflow.Job
+import koflow.JobStore
+import koflow.Worker
+import koflow.JobHandler
+
+void expectFailure(() -> Bool action) {
+    var failed = false
+    try {
+        action()
+    } catch (Exception error) {
+        failed = true
+    }
+    assert(failed, "era esperado um erro explícito")
+}
+
+void checkValidation(JobStore store) {
+    expectFailure(() -> { store.enqueue(" ", "x", 1); return true })
+    expectFailure(() -> { store.enqueue("valid", "x", 0); return true })
+    expectFailure(() -> { store.enqueue("valid", "x", 1001); return true })
+    expectFailure(() -> { store.claim("valid", -1L, 100L); return true })
+    expectFailure(() -> { store.claim("valid", 0L, 0L); return true })
+    expectFailure(() -> { store.claim("valid", 0L, 86400001L); return true })
+    expectFailure(() -> { store.claim("valid", 9223372036854775807L, 1L); return true })
+    expectFailure(() -> { store.get("' OR 1=1 --"); return true })
+    expectFailure(() -> { JobStore(":memory:"); return true })
+    expectFailure(() -> { JobStore(" "); return true })
+    expectFailure(() -> { JobStore("file:anything?mode=memory"); return true })
+    assert(store.claim("unknown", 1000L, 100L).size == 0)
+    println("PASS validação e ausência de trabalho")
+}
+
+void checkOrdering(JobStore store) {
+    var a = store.enqueue("order", "a", 1)
+    var other = store.enqueue("other", "isolado", 1)
+    var b = store.enqueue("order", "b", 1)
+    var first = store.claim("order", 1000L, 100L).get(0)
+    assert(first.id == a)
+    var reopened = JobStore(config.env("TEST_DB"))
+    var second = reopened.claim("order", 1000L, 100L).get(0)
+    assert(second.id == b)
+    assert(store.get(other).status == "pending")
+    assert(store.succeed(first, 1001L))
+    assert(reopened.succeed(second, 1001L))
+    assert(store.claim("order", 1200L, 100L).size == 0)
+    println("PASS ordem, filtro por kind e conexões distintas")
+}
+
+void checkRetries(JobStore store) {
+    var id = store.enqueue("retry", "payload", 2)
+    var first = store.claim("retry", 0L, 100L).get(0)
+    assert(store.fail(first, "primeira falha", 1L))
+    assert(store.get(id).status == "pending")
+    assert(store.get(id).last_error == "primeira falha")
+    var second = store.claim("retry", 2L, 100L).get(0)
+    assert(second.attempts == 2)
+    assert(!store.succeed(first, 3L))
+    assert(!store.fail(first, "antigo", 3L))
+    assert(store.fail(second, "falha definitiva", 3L))
+    assert(store.get(id).status == "failed")
+    assert(store.get(id).lease_until == 0L)
+    assert(store.claim("retry", 10000L, 100L).size == 0)
+    println("PASS retries limitados e confirmação obsoleta")
+}
+
+void checkRecovery(JobStore store) {
+    var id = store.enqueue("recovery", "p", 2)
+    var first = store.claim("recovery", 1000L, 100L).get(0)
+    assert(!store.succeed(first, 1100L))
+    assert(!store.fail(first, "expirado", 1100L))
+    assert(store.get(id).status == "running")
+    var second = store.claim("recovery", 1100L, 100L).get(0)
+    assert(second.id == first.id)
+    assert(second.attempts == 2)
+    assert(!store.succeed(first, 1101L))
+    assert(store.claim("recovery", 1200L, 100L).size == 0)
+    assert(store.get(id).status == "failed")
+    assert(store.get(id).attempts == 2)
+    println("PASS expiração no limite e orçamento de recuperação")
+}
+
+void checkRollback(JobStore store) {
+    var id = store.enqueue("rollback", "p", 3)
+    var first = store.claim("rollback", 0L, 100L).get(0)
+    var conn = db.connect("jdbc:sqlite:" + config.env("TEST_DB"))
+    try {
+        db.execute(conn, "CREATE TRIGGER reject_claim BEFORE UPDATE ON jobs WHEN NEW.status = 'running' BEGIN SELECT RAISE(ABORT, 'rejected'); END")
+        expectFailure(() -> { store.claim("rollback", 100L, 100L); return true })
+        assert(store.get(id).status == "running", "recuperação parcial deveria ser revertida")
+        assert(store.get(id).attempts == 1)
+        assert(store.get(id).lease_until == 100L)
+        db.execute(conn, "DROP TRIGGER reject_claim")
+        var recovered = store.claim("rollback", 100L, 100L).get(0)
+        assert(recovered.attempts == 2)
+        assert(store.succeed(recovered, 101L))
+    } finally {
+        db.close(conn)
+    }
+    println("PASS rollback real em falha SQL intermediária")
+}
+
+void checkSchema() {
+    var foreignPath = config.env("TEST_DB") + ".foreign"
+    var foreign = db.connect("jdbc:sqlite:" + foreignPath)
+    db.execute(foreign, "CREATE TABLE unrelated(id INTEGER)")
+    expectFailure(() -> { JobStore(foreignPath); return true })
+    assert(db.query(foreign, "SELECT * FROM unrelated").size == 0)
+    db.close(foreign)
+    var versionPath = config.env("TEST_DB") + ".version"
+    var version = db.connect("jdbc:sqlite:" + versionPath)
+    db.execute(version, "PRAGMA user_version = 99")
+    expectFailure(() -> { JobStore(versionPath); return true })
+    db.close(version)
+    var identityPath = config.env("TEST_DB") + ".identity"
+    var identity = db.connect("jdbc:sqlite:" + identityPath)
+    db.execute(identity, "PRAGMA user_version = 1")
+    expectFailure(() -> { JobStore(identityPath); return true })
+    db.close(identity)
+    var walPath = config.env("TEST_DB") + ".wal"
+    var wal = db.connect("jdbc:sqlite:" + walPath)
+    db.query(wal, "PRAGMA journal_mode = WAL")
+    expectFailure(() -> { JobStore(walPath); return true })
+    db.close(wal)
+    println("PASS bancos incompatíveis recusados")
+}
+
+void checkIgnoredWrites(JobStore store) {
+    var id = store.enqueue("ignored", "p", 1)
+    var conn = db.connect("jdbc:sqlite:" + config.env("TEST_DB"))
+    try {
+        db.execute(conn, "CREATE TRIGGER ignore_insert BEFORE INSERT ON jobs BEGIN SELECT RAISE(IGNORE); END")
+        expectFailure(() -> { store.enqueue("ignored-new", "p", 1); return true })
+        assert(db.query(conn, "SELECT * FROM jobs WHERE kind = 'ignored-new'").size == 0)
+        db.execute(conn, "DROP TRIGGER ignore_insert")
+        db.execute(conn, "CREATE TRIGGER ignore_claim BEFORE UPDATE ON jobs WHEN NEW.status = 'running' BEGIN SELECT RAISE(IGNORE); END")
+        expectFailure(() -> { store.claim("ignored", 0L, 100L); return true })
+        assert(store.get(id).status == "pending")
+        assert(store.get(id).attempts == 0)
+        db.execute(conn, "DROP TRIGGER ignore_claim")
+    } finally {
+        db.close(conn)
+    }
+    println("PASS escrita sem linhas afetadas não retorna sucesso")
+}
+
+void checkWorker(JobStore store) {
+    var id = store.enqueue("worker", "entrada", 2)
+    var worker = Worker(store, "worker", 60000L)
+    assert(worker.runOnce(FailingHandler()))
+    assert(store.get(id).status == "pending")
+    assert(store.get(id).last_error.contains("falha do handler"))
+    assert(worker.runOnce(NestedHandler()))
+    assert(store.get(id).status == "succeeded")
+    assert(store.get(id).attempts == 2)
+    assert(!worker.runOnce(FailingHandler()))
+    println("PASS worker, handler e enqueue durante execução")
+}
+
+class FailingHandler implements JobHandler {
+    public void execute(String id, String payload, Int attempt) {
+        throw "falha do handler"
+    }
+}
+
+class NestedHandler implements JobHandler {
+    public void execute(String id, String payload, Int attempt) {
+        assert(payload == "entrada")
+        var store = JobStore(config.env("TEST_DB"))
+        store.enqueue("nested", "criado fora da transação", 1)
+    }
+}
+
+void checkWorkerErrors(JobStore store) {
+    var sqlId = store.enqueue("sql-handler", "p", 1)
+    var sqlWorker = Worker(store, "sql-handler", 60000L)
+    assert(sqlWorker.runOnce(SqlFailureHandler()))
+    assert(store.get(sqlId).status == "failed")
+    assert(store.get(sqlId).last_error.contains("missing_table"))
+
+    var ackId = store.enqueue("ack-error", "p", 2)
+    var ackWorker = Worker(store, "ack-error", 60000L)
+    expectFailure(() -> { ackWorker.runOnce(AckFailureHandler()); return true })
+    var uncertain = store.get(ackId)
+    assert(uncertain.status == "running", "erro de ack não é erro do handler")
+    assert(uncertain.last_error == "")
+    var conn = db.connect("jdbc:sqlite:" + config.env("TEST_DB"))
+    db.execute(conn, "DROP TRIGGER reject_ack")
+    db.close(conn)
+    assert(store.succeed(uncertain, time.now()))
+
+    var staleId = store.enqueue("supersede", "p", 3)
+    var staleWorker = Worker(store, "supersede", 60000L)
+    expectFailure(() -> { staleWorker.runOnce(SupersedeHandler()); return true })
+    assert(store.get(staleId).status == "running")
+    assert(store.get(staleId).attempts == 2)
+    println("PASS falhas JDBC do handler, erro de ack e concessão perdida")
+}
+
+class SqlFailureHandler implements JobHandler {
+    public void execute(String id, String payload, Int attempt) {
+        var conn = db.connect("jdbc:sqlite:" + config.env("TEST_DB"))
+        try {
+            db.query(conn, "SELECT * FROM missing_table")
+        } finally {
+            db.close(conn)
+        }
+    }
+}
+
+class AckFailureHandler implements JobHandler {
+    public void execute(String id, String payload, Int attempt) {
+        var conn = db.connect("jdbc:sqlite:" + config.env("TEST_DB"))
+        try {
+            db.execute(conn, "CREATE TRIGGER reject_ack BEFORE UPDATE ON jobs WHEN NEW.status = 'succeeded' BEGIN SELECT RAISE(ABORT, 'ack rejected'); END")
+        } finally {
+            db.close(conn)
+        }
+    }
+}
+
+class SupersedeHandler implements JobHandler {
+    public void execute(String id, String payload, Int attempt) {
+        var store = JobStore(config.env("TEST_DB"))
+        var current = store.get(id)
+        var next = store.claim("supersede", current.lease_until, 60000L).get(0)
+        assert(next.attempts == attempt + 1)
+    }
+}

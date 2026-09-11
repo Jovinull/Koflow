@@ -1,0 +1,37 @@
+import koflow.Job
+import koflow.JobStore
+
+main() {
+    var action = config.str("test.action", "suite")
+    if (action != "suite") {
+        runProcessCase(action)
+        return
+    }
+    var store = JobStore(config.env("TEST_DB"))
+    var id = store.enqueue("echo.v1", "ação ' ; --\nlinha", 2)
+    var pending = store.get(id)
+    assert(pending.status == "pending")
+    assert(pending.attempts == 0)
+    assert(pending.payload == "ação ' ; --\nlinha")
+    var jobs = store.claim("echo.v1", 1000L, 100L)
+    assert(jobs.size == 1)
+    var job = jobs.get(0)
+    assert(job.id == id)
+    assert(job.attempts == 1)
+    assert(job.lease_until == 1100L)
+    assert(store.claim("echo.v1", 1099L, 100L).size == 0)
+    assert(store.succeed(job, 1099L))
+    assert(store.get(id).status == "succeeded")
+    assert(!store.succeed(job, 1099L))
+    println("PASS roundtrip e transição de sucesso")
+    checkValidation(store)
+    checkOrdering(store)
+    checkRetries(store)
+    checkRecovery(store)
+    checkRollback(store)
+    checkIgnoredWrites(store)
+    checkSchema()
+    checkWorker(store)
+    checkWorkerErrors(store)
+    println("PASS todos os contratos")
+}
