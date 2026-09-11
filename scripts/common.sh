@@ -6,6 +6,8 @@ TOOL_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/koflow"
 KOF="${KOF:-$TOOL_CACHE/kof-0.3.22-beta-linux-x86_64/bin/kof}"
 JAVA="${JAVA:-$TOOL_CACHE/kof-0.3.22-beta-linux-x86_64/jdk/bin/java}"
 SQLITE_JDBC="${SQLITE_JDBC:-$TOOL_CACHE/sqlite-jdbc-3.53.4.0.jar}"
+# Windows usa Cp1252 em stdout/stderr por padrão; UTF-8 mantém a saída legível nos dois sistemas.
+JAVA_OPTS=(-Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8)
 
 require_tools() {
     if [[ ! -x "$KOF" || ! -x "$JAVA" || ! -f "$SQLITE_JDBC" ]]; then
@@ -22,5 +24,5 @@ compile() {
 run_class() {
     local output_dir="$1" class_name="$2"
     shift 2
-    "$JAVA" -cp "$output_dir:$SQLITE_JDBC" "$class_name" "$@"
+    "$JAVA" "${JAVA_OPTS[@]}" -cp "$output_dir:$SQLITE_JDBC" "$class_name" "$@"
 }
