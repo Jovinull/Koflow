@@ -1,0 +1,5 @@
+package koflow
+
+interface JobHandler {
+    void execute(String id, String payload, Int attempt)
+}

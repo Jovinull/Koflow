@@ -1,0 +1,44 @@
+package koflow
+
+import koflow.Job
+
+class Worker {
+    private JobStore store
+    private String kind
+    private Long leaseMillis
+
+    public constructor(JobStore store, String kind, Long leaseMillis) {
+        if (kind.trim() == "" || kind.length > 200 || leaseMillis < 1 || leaseMillis > 86400000L) {
+            throw "Configuração de worker inválida"
+        }
+        this.store = store
+        this.kind = kind
+        this.leaseMillis = leaseMillis
+    }
+
+    public Bool runOnce(JobHandler handler) {
+        var jobs = this.store.claim(this.kind, time.now(), this.leaseMillis)
+        if (jobs.size == 0) {
+            return false
+        }
+        var job = jobs.get(0)
+        var failed = false
+        var detail = ""
+        try {
+            handler.execute(job.id, job.payload, job.attempts)
+        } catch (Exception error) {
+            failed = true
+            detail = "" + error
+        }
+        var acknowledged = false
+        if (failed) {
+            acknowledged = this.store.fail(job, detail, time.now())
+        } else {
+            acknowledged = this.store.succeed(job, time.now())
+        }
+        if (!acknowledged) {
+            throw "A concessão do job expirou ou pertence a outra tentativa"
+        }
+        return true
+    }
+}

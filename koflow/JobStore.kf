@@ -1,0 +1,175 @@
+package koflow
+
+import koflow.Job
+
+record SchemaVersion(Int user_version)
+record JournalMode(String journal_mode)
+record TableCount(Int count)
+record ApplicationId(Int application_id)
+
+class JobStore {
+    private String path
+
+    public constructor(String path) {
+        if (path.trim() == "" || path == ":memory:" || path.startsWith("file:")) {
+            throw "Use um caminho de arquivo SQLite persistente"
+        }
+        this.path = path
+        this.initialize()
+    }
+
+    private String connect() {
+        var conn = db.connect("jdbc:sqlite:" + this.path)
+        var ready = false
+        try {
+            db.query(conn, "PRAGMA busy_timeout = 5000")
+            var mode = db.query<koflow.JournalMode>(conn, "PRAGMA journal_mode")
+            if (mode.get(0).journal_mode != "delete") {
+                throw "O banco precisa usar journal_mode DELETE"
+            }
+            db.execute(conn, "PRAGMA synchronous = FULL")
+            ready = true
+            return conn
+        } finally {
+            if (!ready) {
+                db.close(conn)
+            }
+        }
+    }
+
+    private void initialize() {
+        var conn = this.connect()
+        var started = false
+        var committed = false
+        try {
+            db.execute(conn, "BEGIN IMMEDIATE")
+            started = true
+            var version = db.query<koflow.SchemaVersion>(conn, "PRAGMA user_version").get(0).user_version
+            var application = db.query<koflow.ApplicationId>(conn, "PRAGMA application_id").get(0).application_id
+            if (version == 0) {
+                var tables = db.query<koflow.TableCount>(conn, "SELECT count(*) AS count FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
+                if (tables.get(0).count != 0 || application != 0) {
+                    throw "O arquivo precisa ser um banco dedicado ao Koflow"
+                }
+                db.execute(conn, "CREATE TABLE jobs (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, kind TEXT NOT NULL CHECK(length(kind) BETWEEN 1 AND 200), payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running','succeeded','failed')), attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0 AND attempts <= max_attempts), max_attempts INTEGER NOT NULL CHECK(max_attempts BETWEEN 1 AND 1000), lease_until INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', CHECK((status = 'running' AND lease_until > 0 AND attempts > 0) OR (status != 'running' AND lease_until = 0)))")
+                db.execute(conn, "CREATE INDEX jobs_pending ON jobs(kind, status, seq)")
+                db.execute(conn, "CREATE INDEX jobs_expired ON jobs(kind, status, lease_until)")
+                db.execute(conn, "PRAGMA user_version = 1")
+                db.execute(conn, "PRAGMA application_id = 1263488844")
+            } else if (version != 1 || application != 1263488844) {
+                throw "Versão de schema não suportada"
+            }
+            db.query<koflow.Job>(conn, "SELECT id, kind, payload, status, attempts, max_attempts, lease_until, last_error FROM jobs LIMIT 0")
+            db.execute(conn, "COMMIT")
+            committed = true
+        } finally {
+            try {
+                if (started && !committed) {
+                    db.execute(conn, "ROLLBACK")
+                }
+            } finally {
+                db.close(conn)
+            }
+        }
+    }
+
+    public String enqueue(String kind, String payload, Int maxAttempts) {
+        this.validateKind(kind)
+        if (maxAttempts < 1 || maxAttempts > 1000) {
+            throw "maxAttempts deve estar entre 1 e 1000"
+        }
+        var id = uuid.v4()
+        var conn = this.connect()
+        try {
+            var inserted = db.execute(conn, "INSERT INTO jobs(id, kind, payload, max_attempts) VALUES (?, ?, ?, ?)", id, kind, payload, maxAttempts)
+            if (inserted != 1) {
+                throw "Job não foi persistido"
+            }
+            return id
+        } finally {
+            db.close(conn)
+        }
+    }
+
+    public Job get(String id) {
+        var conn = this.connect()
+        try {
+            var rows = db.query<koflow.Job>(conn, "SELECT * FROM jobs WHERE id = ?", id)
+            if (rows.size == 0) {
+                throw "Job não encontrado"
+            }
+            return rows.get(0)
+        } finally {
+            db.close(conn)
+        }
+    }
+
+    public List<Job> claim(String kind, Long now, Long leaseMillis) {
+        this.validateKind(kind)
+        if (now < 0 || now > 9223372036768375807L || leaseMillis < 1 || leaseMillis > 86400000L) {
+            throw "Relógio ou duração da concessão inválidos"
+        }
+        var conn = this.connect()
+        var started = false
+        var committed = false
+        try {
+            db.execute(conn, "BEGIN IMMEDIATE")
+            started = true
+            db.execute(conn, "UPDATE jobs SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END, lease_until = 0, last_error = 'Prazo de execução expirado' WHERE kind = ? AND status = 'running' AND lease_until <= ?", kind, now)
+            var rows = db.query<koflow.Job>(conn, "SELECT * FROM jobs WHERE kind = ? AND status = 'pending' ORDER BY seq LIMIT 1", kind)
+            if (rows.size > 0) {
+                var id = rows.get(0).id
+                var changed = db.execute(conn, "UPDATE jobs SET status = 'running', attempts = attempts + 1, lease_until = ? WHERE id = ? AND status = 'pending'", now + leaseMillis, id)
+                if (changed != 1) {
+                    throw "Não foi possível conceder a execução do job"
+                }
+                rows = db.query<koflow.Job>(conn, "SELECT * FROM jobs WHERE id = ?", id)
+            }
+            db.execute(conn, "COMMIT")
+            committed = true
+            return rows
+        } finally {
+            try {
+                if (started && !committed) {
+                    db.execute(conn, "ROLLBACK")
+                }
+            } finally {
+                db.close(conn)
+            }
+        }
+    }
+
+    public Bool succeed(Job job, Long now) {
+        if (now < 0) {
+            throw "Relógio inválido"
+        }
+        var conn = this.connect()
+        try {
+            return db.execute(conn, "UPDATE jobs SET status = 'succeeded', lease_until = 0, last_error = '' WHERE id = ? AND attempts = ? AND status = 'running' AND lease_until > ?", job.id, job.attempts, now) == 1
+        } finally {
+            db.close(conn)
+        }
+    }
+
+    public Bool fail(Job job, String error, Long now) {
+        if (now < 0) {
+            throw "Relógio inválido"
+        }
+        var detail = error
+        if (detail.length > 4096) {
+            detail = detail.substring(0, 4096)
+        }
+        var conn = this.connect()
+        try {
+            return db.execute(conn, "UPDATE jobs SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END, lease_until = 0, last_error = ? WHERE id = ? AND attempts = ? AND status = 'running' AND lease_until > ?", detail, job.id, job.attempts, now) == 1
+        } finally {
+            db.close(conn)
+        }
+    }
+
+    private void validateKind(String kind) {
+        if (kind.trim() == "" || kind.length > 200) {
+            throw "kind deve ter entre 1 e 200 caracteres"
+        }
+    }
+}
