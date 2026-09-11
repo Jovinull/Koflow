@@ -8,15 +8,21 @@
 ![SQLite](https://img.shields.io/badge/storage-SQLite-003b57)
 ![Status](https://img.shields.io/badge/status-experimental-d97706)
 
-**Background jobs persistentes, escritos em [Kof](https://github.com/KofLang/Kof4j).**
+**Runtime de execução durável e orquestração, escrito em [Kof](https://github.com/KofLang/Kof4j).**
 
 Envie o trabalho para depois, execute em outro processo e mantenha seu estado salvo.
-O Koflow usa SQLite para registrar jobs, controlar tentativas e recuperar execuções
-interrompidas — com uma biblioteca pequena, handlers explícitos e testes de falha reais.
+O problema que o Koflow resolve não é enfileirar chamadas: é manter a execução íntegra
+quando o processo morre no meio dela. O estado de execução vive em SQLite, as tentativas
+são contadas e uma execução interrompida volta a ficar disponível.
 
-É uma base para tarefas como gerar relatórios, processar arquivos e integrar serviços
-fora da requisição principal. A biblioteca, os exemplos e as asserções são escritos
-em Kof; a execução atual usa o JVM.
+A Kof oferece as primitives da linguagem; o Koflow acrescenta a camada acima delas —
+semântica de execução, estado durável, recuperação e coordenação entre processos.
+
+Hoje o runtime roda embutido na própria aplicação, no alvo JVM, e entrega a primeira
+camada dessa proposta: jobs persistentes com concessão, tentativas limitadas e
+recuperação após interrupção. É uma base para tarefas como gerar relatórios, processar
+arquivos e integrar serviços fora da requisição principal. Runtime, exemplos e
+asserções são escritos em Kof.
 
 ## O que já funciona
 
@@ -30,6 +36,17 @@ O projeto é **experimental**. A recuperação foi testada com `SIGKILL` e a dis
 por um job foi exercitada entre oito processos, nos dois ambientes validados.
 Efeitos externos podem se repetir; handlers devem ser idempotentes.
 Veja o [contrato de execução](#contrato-de-execução).
+
+## Estado e direção
+
+| Estágio | Conteúdo |
+| --- | --- |
+| **Hoje** | Jobs persistentes locais: enqueue, concessão de execução, retries limitados, recuperação após crash e disputa entre processos. Experimental. |
+| **Próximo** | Backoff e execução pontual futura; filas explícitas e ciclo de vida de workers. Planejado, ainda não implementado. |
+| **Direção** | Histórico durável de execução, workflows e DAGs, ferramental de operação e workers remotos. |
+
+Apenas a linha "Hoje" existe no código. As demais indicam para onde o runtime cresce,
+não o que ele já faz.
 
 ## Comece por aqui
 
@@ -184,12 +201,12 @@ Erros podem conter dados da aplicação; restrinja o acesso ao arquivo do banco.
 
 ## Limites operacionais
 
-Use um arquivo SQLite dedicado em disco local, com journal `DELETE`. A biblioteca
+Use um arquivo SQLite dedicado em disco local, com journal `DELETE`. O runtime
 usa `synchronous=FULL`, espera até 5 segundos por locks e recusa identidade ou
 versão de schema incompatível. O diretório pai deve existir. Não use `:memory:`,
 URI `file:`, compartilhamento de rede ou o mesmo arquivo de outro sistema.
 
-Este pacote não inclui cron, agendamento futuro, backoff, heartbeat, cancelamento,
+Esta versão não inclui cron, agendamento futuro, backoff, heartbeat, cancelamento,
 timeout preemptivo, pool gerenciado, servidor, dashboard, DAGs ou workflows duráveis.
 Não remove jobs automaticamente e mantém apenas o último erro, sem histórico
 completo de tentativas. A disputa de claims entre processos é testada; outros
