@@ -26,16 +26,20 @@ em Kof; a execução atual usa o JVM.
 - **Controle de posse:** confirmações de tentativas antigas são rejeitadas.
 - **Inspeção simples:** consulte estado, tentativas e último erro pelo ID do job.
 
-O projeto é **experimental**. A recuperação foi testada com `SIGKILL`, e a disputa
-por um job foi exercitada entre oito processos. Efeitos externos podem se repetir;
-handlers devem ser idempotentes. Veja o [contrato de execução](#contrato-de-execução).
+O projeto é **experimental**. A recuperação foi testada com `SIGKILL` e a disputa
+por um job foi exercitada entre oito processos, nos dois ambientes validados.
+Efeitos externos podem se repetir; handlers devem ser idempotentes.
+Veja o [contrato de execução](#contrato-de-execução).
 
 ## Comece por aqui
 
-Ambiente validado: Linux x86_64, Kof 0.3.22-beta/JVM, JDK 21 e SQLite JDBC 3.53.4.0.
-Os scripts precisam de Bash, Make, curl, tar e coreutils; os testes também usam `rg`
-(ripgrep). O bootstrap baixa versões fixas, confere SHA-256 e instala em
+Ambientes validados: Linux x86_64 e Windows 11 x86_64 no Git Bash, ambos com
+Kof 0.3.22-beta/JVM, JDK 21 e SQLite JDBC 3.53.4.0. Os scripts precisam de Bash, curl,
+tar e coreutils; os testes também usam `rg` (ripgrep) com suporte a `--crlf`. O bootstrap
+automático é específico de Linux: ele baixa versões fixas, confere SHA-256 e instala em
 `${XDG_CACHE_HOME:-$HOME/.cache}/koflow`. A distribuição Kof inclui o JDK.
+
+### Linux
 
 ```sh
 git clone https://github.com/Jovinull/Koflow.git
@@ -46,10 +50,44 @@ make test
 make demo
 ```
 
-`make build` gera as classes em `build/classes`. `make test` verifica contratos
-de estado, erros SQL, reabertura, disputa entre processos e recuperação após
-`SIGKILL`. `make demo` inicia um produtor e um consumidor em processos separados,
-usando um banco temporário que é removido ao final.
+### Windows
+
+`make bootstrap` exige Linux x86_64 e o Git for Windows não inclui `make`. No Windows a
+instalação é manual, com a distribuição `windows-x86_64`, e os scripts são chamados
+diretamente pelo Bash. Execute tudo no **Git Bash**, a partir da raiz do repositório.
+
+```sh
+cache="$HOME/.cache/koflow"
+tmp="$(mktemp -d)"
+mkdir -p "$cache"
+base=https://github.com/KofLang/Kof4j/releases/download/kof-0.3.22-beta-windows-x86_64
+curl -fL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS"
+curl -fL -o "$tmp/kof-0.3.22-beta-windows-x86_64.zip" "$base/kof-0.3.22-beta-windows-x86_64.zip"
+(cd "$tmp" && sha256sum -c SHA256SUMS)
+unzip -q "$tmp/kof-0.3.22-beta-windows-x86_64.zip" -d "$cache"
+jdbc=https://repo.maven.apache.org/maven2/org/xerial/sqlite-jdbc/3.53.4.0
+curl -fL -o "$cache/sqlite-jdbc-3.53.4.0.jar" "$jdbc/sqlite-jdbc-3.53.4.0.jar"
+rm -rf "$tmp"
+
+export KOF="$cache/kof-0.3.22-beta-windows-x86_64/bin/kof"
+export JAVA="$cache/kof-0.3.22-beta-windows-x86_64/jdk/bin/java"
+export SQLITE_JDBC="$cache/sqlite-jdbc-3.53.4.0.jar"
+
+bash scripts/build.sh
+bash scripts/test.sh
+bash scripts/demo.sh
+```
+
+Instale o ripgrep antes dos testes, por exemplo com
+`winget install BurntSushi.ripgrep.MSVC`, e abra um terminal novo para que ele entre no
+PATH. Use `bin/kof` no Git Bash; `bin/kof.bat` é o launcher para cmd e PowerShell. Os
+scripts definem `stdout.encoding` e `stderr.encoding` como UTF-8 porque o padrão do JVM
+no Windows é Cp1252, que corrompe acentos na saída.
+
+`make build`, ou `bash scripts/build.sh`, gera as classes em `build/classes`.
+`make test` verifica contratos de estado, erros SQL, reabertura, disputa entre
+processos e recuperação após `SIGKILL`. `make demo` inicia um produtor e um
+consumidor em processos separados, usando um banco temporário removido ao final.
 
 Para usar instalações próprias, configure `KOF`, `JAVA` e `SQLITE_JDBC` com
 caminhos absolutos. O driver deve estar no classpath da aplicação. Os scripts
