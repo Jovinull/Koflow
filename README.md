@@ -1,8 +1,36 @@
 # Koflow
 
-Background jobs persistentes para Kof, com SQLite e execução no JVM. Biblioteca
-experimental para enfileirar trabalho, executar handlers e recuperar tentativas
-interrompidas. O código da biblioteca, dos exemplos e das asserções é escrito em Kof.
+### O processo pode parar. O trabalho continua registrado.
+
+[![CI](https://github.com/Jovinull/Koflow/actions/workflows/ci.yml/badge.svg)](https://github.com/Jovinull/Koflow/actions/workflows/ci.yml)
+[![Kof](https://img.shields.io/badge/Kof-0.3.22--beta-7c3aed)](https://github.com/KofLang/Kof4j)
+![Backend](https://img.shields.io/badge/backend-JVM-2563eb)
+![SQLite](https://img.shields.io/badge/storage-SQLite-003b57)
+![Status](https://img.shields.io/badge/status-experimental-d97706)
+
+**Background jobs persistentes, escritos em [Kof](https://github.com/KofLang/Kof4j).**
+
+Envie o trabalho para depois, execute em outro processo e mantenha seu estado salvo.
+O Koflow usa SQLite para registrar jobs, controlar tentativas e recuperar execuções
+interrompidas — com uma biblioteca pequena, handlers explícitos e testes de falha reais.
+
+É uma base para tarefas como gerar relatórios, processar arquivos e integrar serviços
+fora da requisição principal. A biblioteca, os exemplos e as asserções são escritos
+em Kof; a execução atual usa o JVM.
+
+## O que já funciona
+
+- **Persistência:** jobs e payloads sobrevivem ao encerramento do processo.
+- **Retries limitados:** falhas podem ser repetidas até o orçamento de tentativas.
+- **Recuperação:** uma execução interrompida volta a ficar disponível após expirar seu prazo.
+- **Controle de posse:** confirmações de tentativas antigas são rejeitadas.
+- **Inspeção simples:** consulte estado, tentativas e último erro pelo ID do job.
+
+O projeto é **experimental**. A recuperação foi testada com `SIGKILL`, e a disputa
+por um job foi exercitada entre oito processos. Efeitos externos podem se repetir;
+handlers devem ser idempotentes. Veja o [contrato de execução](#contrato-de-execução).
+
+## Comece por aqui
 
 Ambiente validado: Linux x86_64, Kof 0.3.22-beta/JVM, JDK 21 e SQLite JDBC 3.53.4.0.
 Os scripts precisam de Bash, Make, curl, tar e coreutils; os testes também usam `rg`
@@ -10,6 +38,8 @@ Os scripts precisam de Bash, Make, curl, tar e coreutils; os testes também usam
 `${XDG_CACHE_HOME:-$HOME/.cache}/koflow`. A distribuição Kof inclui o JDK.
 
 ```sh
+git clone https://github.com/Jovinull/Koflow.git
+cd Koflow
 make bootstrap
 make build
 make test
@@ -126,3 +156,13 @@ timeout preemptivo, pool gerenciado, servidor, dashboard, DAGs ou workflows dur�
 Não remove jobs automaticamente e mantém apenas o último erro, sem histórico
 completo de tentativas. A disputa de claims entre processos é testada; outros
 backends Kof e falhas físicas de disco ou energia não foram validados.
+
+## Encontrou um problema?
+
+[Abra uma issue](https://github.com/Jovinull/Koflow/issues/new) com a versão da Kof,
+o sistema operacional, um exemplo mínimo e o comportamento esperado e observado.
+Para conferir o pacote localmente, execute `make test` e `make demo`.
+
+O Koflow é um projeto independente para o ecossistema Kof. Conheça também a
+[linguagem e seu compilador](https://github.com/KofLang/Kof4j) e a
+[documentação oficial](https://koflang.github.io/).
