@@ -11,19 +11,20 @@ class PrintHandler implements JobHandler {
 main() {
     var store = JobStore(config.str("database", "jobs.db"))
     var action = config.str("action", "work")
-    if (action == "enqueue") {
-        var id = store.enqueue("print.v1", config.str("payload", "Olá, Koflow!"), 3)
-        println("Criado " + id)
-    } else if (action == "work") {
-        var worker = Worker(store, "print.v1", 60000L)
-        var handler = PrintHandler()
-        while (worker.runOnce(handler)) {
-        }
-        println("Sem jobs disponíveis")
-    } else if (action == "show") {
-        var job = store.get(config.str("id", ""))
-        println(job.id + " " + job.status + " tentativas=" + job.attempts)
-    } else {
-        throw "Ação inválida: use enqueue, work ou show"
+    switch (action) {
+        case "enqueue":
+            var id = store.enqueue("print.v1", config.str("payload", "Olá, Koflow!"), 3)
+            println("Criado " + id)
+        case "work":
+            var worker = Worker(store, "print.v1", 60000L)
+            var handler = PrintHandler()
+            while (worker.runOnce(handler)) {
+            }
+            println("Sem jobs disponíveis")
+        case "show":
+            var job = store.get(config.str("id", ""))
+            println(job.id + " " + job.status + " tentativas=" + job.attempts)
+        default:
+            throw "Ação inválida: use enqueue, work ou show"
     }
 }

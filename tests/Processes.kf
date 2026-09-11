@@ -2,23 +2,24 @@ import koflow.JobStore
 
 void runProcessCase(String action) {
     var store = JobStore(config.env("TEST_DB"))
-    if (action == "seed") {
-        println(store.enqueue("process", "persistido em outro processo", 3))
-    } else if (action == "hold") {
-        holdClaim(store)
-    } else if (action == "recover") {
-        recoverClaim(store)
-    } else if (action == "race") {
-        raceClaim(store)
-    } else if (action == "verify-race") {
-        verifyRace()
-    } else if (action == "uncommitted") {
-        holdUncommitted()
-    } else if (action == "verify-rollback") {
-        assert(store.claim("process", time.now(), 1000L).size == 0)
-        println("PASS escrita não confirmada revertida após SIGKILL")
-    } else {
-        throw "Caso de processo desconhecido"
+    switch (action) {
+        case "seed":
+            println(store.enqueue("process", "persistido em outro processo", 3))
+        case "hold":
+            holdClaim(store)
+        case "recover":
+            recoverClaim(store)
+        case "race":
+            raceClaim(store)
+        case "verify-race":
+            verifyRace()
+        case "uncommitted":
+            holdUncommitted()
+        case "verify-rollback":
+            assert(store.claim("process", time.now(), 1000L).size == 0)
+            println("PASS escrita não confirmada revertida após SIGKILL")
+        default:
+            throw "Caso de processo desconhecido"
     }
 }
 
