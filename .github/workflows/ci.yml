@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Kof JVM / SQLite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Obter código
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Instalar dependências dos testes
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+      - name: Preparar Kof e SQLite
+        run: make bootstrap
+      - name: Compilar biblioteca
+        run: make build
+      - name: Testar contratos e recuperação
+        run: make test
+      - name: Executar demonstração
+        run: make demo
