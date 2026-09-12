@@ -280,3 +280,10 @@ Para conferir o pacote localmente, execute `make test` e `make demo`.
 O Koflow é um projeto independente para o ecossistema Kof. Conheça também a
 [linguagem e seu compilador](https://github.com/KofLang/Kof4j) e a
 [documentação oficial](https://koflang.github.io/).
+
+## Licença
+
+Distribuído sob a [Apache License 2.0](LICENSE). A licença concede uso, modificação e
+distribuição, inclusive comercial, com concessão expressa de patentes e exigência de
+preservar avisos de copyright e licença nas cópias.
+
