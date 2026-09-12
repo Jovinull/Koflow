@@ -3,6 +3,7 @@ import koflow.JobAttempt
 import koflow.JobStore
 
 record Version(Int user_version)
+record Linhas(Int total)
 record ColumnInfo(Int cid, String name, String type, Int not_null, String dflt, Int pk)
 record IndexInfo(String name, Int is_unique)
 record IndexColumn(Int seqno, String name)
@@ -211,11 +212,18 @@ void checkMigration() {
 
     var check = db.connect("jdbc:sqlite:" + path)
     try {
-        assert(db.query<Version>(check, "PRAGMA user_version").get(0).user_version == 2)
+        assert(db.query<Version>(check, "PRAGMA user_version").get(0).user_version == 3)
     } finally {
         db.close(check)
     }
-    println("PASS migração v1 para v2 preserva jobs, estados e elegibilidade")
+    var legado = db.connect("jdbc:sqlite:" + path)
+    try {
+        assert(db.query<Linhas>(legado, "SELECT count(*) AS total FROM jobs WHERE terminal_at IS NULL").get(0).total > 0,
+            "job migrado da v1 tem instante terminal desconhecido")
+    } finally {
+        db.close(legado)
+    }
+    println("PASS migração v1 para v3 preserva jobs, estados e elegibilidade")
 }
 
 void checkSchemaParity() {
@@ -520,4 +528,3 @@ void rejectsInvalidWrites(String path) {
         db.close(conn)
     }
 }
-

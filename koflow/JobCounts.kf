@@ -1,0 +1,4 @@
+package koflow
+
+record JobCounts(Int pending_ready, Int pending_scheduled, Int running,
+    Int succeeded, Int failed)
