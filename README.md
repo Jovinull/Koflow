@@ -32,7 +32,10 @@ asserções são escritos em Kof.
 - **Execução pontual futura:** um job pode ser enfileirado para não rodar antes de um instante.
 - **Recuperação:** uma execução interrompida volta a ficar disponível após expirar seu prazo.
 - **Controle de posse:** confirmações de tentativas antigas são rejeitadas.
-- **Inspeção:** consulte o estado atual e a sequência de tentativas pelo ID do job.
+- **Inspeção:** consulte o estado atual, a sequência de tentativas e o que há em cada
+  situação — elegível agora, aguardando o instante, em execução ou terminal.
+- **Retenção explícita:** descarte execuções terminais antigas e o histórico delas,
+  por chamada sua, com limite obrigatório. Nada é apagado sozinho.
 
 O projeto é **experimental**. A recuperação foi testada com `SIGKILL` e a disputa
 por um job foi exercitada entre oito processos, nos dois ambientes validados.
@@ -224,6 +227,21 @@ uma nova tentativa. O relógio deve ser consistente entre os processos do mesmo 
 | `succeed(job, now)` | `true` se confirmou sucesso; `false` se a concessão não é mais válida. |
 | `fail(job, error, now)` | `true` se registrou falha/retry; `false` se a concessão não é mais válida. |
 | `attempts(id)` | Histórico do job, em ordem de tentativa; lança erro se o job não existir. |
+| `counts(kind, now)` | Quantos jobs há em cada situação, inclusive as de contagem zero. |
+| `list(kind, categoria, now, limit)` | Até `limit` jobs de uma situação, em ordem de inserção. |
+| `purge(kind, before, limit)` | Remove até `limit` execuções terminais concluídas antes de `before`, com o histórico delas. Devolve quantas saíram. |
+
+As situações que a inspeção distingue são `pending_ready` (elegível agora),
+`pending_scheduled` (aguardando `available_at`), `running`, `succeeded` e `failed`.
+A distinção entre as duas primeiras depende do instante, por isso `now` é explícito.
+
+A retenção nunca acontece sozinha: não há tarefa de fundo, temporizador nem gatilho.
+Ela só remove jobs em estado terminal cujo instante de conclusão seja conhecido e anterior
+a `before`. Jobs que **já estavam concluídos ou falhos** quando o banco foi migrado não têm
+esse instante registrado — o runtime não o observou — e por isso não são removidos por
+tempo. Jobs que ainda estavam pendentes ou em execução na migração registram o instante
+normalmente ao terminar, e são removíveis como qualquer outro. O `limit` é obrigatório e o trabalho de uma chamada é sempre
+limitado, para que você controle o tamanho da transação.
 
 Cada tentativa vira uma linha de histórico no mesmo instante em que o estado do job
 muda, com `started_at`, `finished_at`, `error` e um `result`:
@@ -259,9 +277,9 @@ URI `file:`, compartilhamento de rede ou o mesmo arquivo de outro sistema.
 
 Esta versão não inclui cron, recorrência, prioridade, heartbeat, cancelamento,
 timeout preemptivo, pool gerenciado, servidor, dashboard, DAGs ou workflows duráveis.
+A retenção é manual e por chamada: não há política automática, por cota ou agendada.
 O agendamento é pontual: um job roda uma vez. O atraso entre tentativas é fixo em
-contrato, não configurável. Jobs e histórico não são removidos automaticamente — não há
-política de retenção. A disputa de claims entre processos é testada; outros backends Kof
+contrato, não configurável. Jobs e histórico só são removidos quando a aplicação chama a retenção. A disputa de claims entre processos é testada; outros backends Kof
 e falhas físicas de disco ou energia não foram validados.
 
 Bancos criados por versões anteriores são migrados na abertura, dentro de uma transação:
