@@ -1,0 +1,523 @@
+import koflow.Job
+import koflow.JobAttempt
+import koflow.JobStore
+
+record Version(Int user_version)
+record ColumnInfo(Int cid, String name, String type, Int not_null, String dflt, Int pk)
+record IndexInfo(String name, Int is_unique)
+record IndexColumn(Int seqno, String name)
+
+void checkHistory(JobStore store) {
+    var id = store.enqueue("history", "p", 2)
+    assert(store.attempts(id).size == 0, "job novo não tem tentativas")
+    var first = store.claim("history", 1000L, 100L).get(0)
+    var opened = store.attempts(id)
+    assert(opened.size == 1)
+    assert(opened.get(0).job_id == id)
+    assert(opened.get(0).attempt == 1)
+    assert(opened.get(0).started_at == 1000L)
+    assert(opened.get(0).finished_at == 0L)
+    assert(opened.get(0).result == "running")
+    assert(store.fail(first, "erro da primeira", 1010L))
+    var closed = store.attempts(id)
+    assert(closed.size == 1)
+    assert(closed.get(0).result == "failed")
+    assert(closed.get(0).finished_at == 1010L)
+    assert(closed.get(0).error == "erro da primeira")
+    var due = store.get(id).available_at
+    var second = store.claim("history", due, 100L).get(0)
+    assert(second.attempts == 2)
+    var two = store.attempts(id)
+    assert(two.size == 2)
+    assert(two.get(1).attempt == 2)
+    assert(two.get(1).started_at == due)
+    assert(two.get(1).result == "running")
+    assert(store.succeed(second, due + 1L))
+    var done = store.attempts(id)
+    assert(done.get(0).result == "failed", "tentativa antiga permanece no histórico")
+    assert(done.get(1).result == "succeeded")
+    assert(done.get(1).error == "")
+    assert(done.get(1).finished_at == due + 1L)
+    assert(store.get(id).status == "succeeded")
+    println("PASS histórico de tentativas com falha seguida de sucesso")
+}
+
+void checkExpiredHistory(JobStore store) {
+    var id = store.enqueue("expired", "p", 2)
+    var first = store.claim("expired", 1000L, 100L).get(0)
+    var second = store.claim("expired", 1100L, 100L).get(0)
+    assert(second.attempts == 2)
+    var rows = store.attempts(id)
+    assert(rows.size == 2)
+    assert(rows.get(0).result == "expired", "concessão perdida não é falha do handler")
+    assert(rows.get(0).finished_at == 1100L)
+    assert(rows.get(0).error == "Prazo de execução expirado")
+    assert(rows.get(1).attempt == 2)
+    assert(rows.get(1).result == "running")
+    assert(store.claim("expired", 1200L, 100L).size == 0)
+    var ended = store.attempts(id)
+    assert(ended.get(1).result == "expired")
+    assert(store.get(id).status == "failed", "esgotamento é estado do job, não resultado da tentativa")
+    assert(store.get(id).attempts == 2)
+    println("PASS expiração distinta de falha e esgotamento no estado do job")
+}
+
+void checkHistoryPersistence(JobStore store) {
+    var id = store.enqueue("persist", "p", 3)
+    var first = store.claim("persist", 2000L, 100L).get(0)
+    assert(store.fail(first, "antes de reabrir", 2001L))
+    var reopened = JobStore(config.env("TEST_DB"))
+    var rows = reopened.attempts(id)
+    assert(rows.size == 1)
+    assert(rows.get(0).result == "failed")
+    assert(rows.get(0).error == "antes de reabrir")
+    assert(reopened.get(id).available_at == store.get(id).available_at)
+    expectFailure(() -> { store.attempts("inexistente"); return true })
+    println("PASS histórico sobrevive à reabertura do banco")
+}
+
+void checkEligibility(JobStore store) {
+    var future = store.enqueueAt("schedule", "futuro", 1, 5000L)
+    assert(store.get(future).available_at == 5000L)
+    assert(store.claim("schedule", 4999L, 100L).size == 0, "não elegível antes do instante")
+    var claimed = store.claim("schedule", 5000L, 100L).get(0)
+    assert(claimed.id == future, "elegível exatamente no instante")
+    assert(store.succeed(claimed, 5001L))
+
+    var later = store.enqueueAt("mixed", "agendado antes, elegível depois", 1, 9000L)
+    var immediate = store.enqueue("mixed", "imediato", 1)
+    var picked = store.claim("mixed", 1000L, 100L).get(0)
+    assert(picked.id == immediate, "ordem de inserção não pode vencer a elegibilidade")
+    assert(store.succeed(picked, 1001L))
+    assert(store.claim("mixed", 8999L, 100L).size == 0)
+    var late = store.claim("mixed", 9000L, 100L).get(0)
+    assert(late.id == later)
+    assert(store.succeed(late, 9001L))
+
+    expectFailure(() -> { store.enqueueAt("schedule", "p", 1, -1L); return true })
+    expectFailure(() -> { store.enqueueAt("schedule", "p", 1, 9223372036854775807L); return true })
+    println("PASS elegibilidade temporal e execução pontual futura")
+}
+
+void checkBackoff(JobStore store) {
+    var id = store.enqueue("backoff", "p", 4)
+    var first = store.claim("backoff", 1000L, 100L).get(0)
+    assert(store.fail(first, "falha 1", 1001L))
+    var afterFirst = store.get(id).available_at
+    assert(afterFirst >= 1001L + 1000L, "atraso mínimo da primeira tentativa")
+    assert(afterFirst <= 1001L + 1000L + 200L, "jitter dentro de 20% do atraso")
+    assert(store.claim("backoff", afterFirst - 1L, 100L).size == 0)
+
+    var second = store.claim("backoff", afterFirst, 100L).get(0)
+    assert(second.attempts == 2)
+    assert(store.fail(second, "falha 2", afterFirst + 1L))
+    var afterSecond = store.get(id).available_at
+    var base = afterFirst + 1L
+    assert(afterSecond >= base + 2000L, "atraso dobra na segunda tentativa")
+    assert(afterSecond <= base + 2000L + 400L)
+
+    var third = store.claim("backoff", afterSecond, 100L).get(0)
+    assert(third.attempts == 3)
+    assert(store.fail(third, "falha 3", afterSecond + 1L))
+    var afterThird = store.get(id).available_at
+    assert(afterThird >= afterSecond + 1L + 4000L)
+    assert(afterThird <= afterSecond + 1L + 4000L + 800L)
+
+    var rows = store.attempts(id)
+    assert(rows.size == 3)
+    assert(rows.get(2).result == "failed")
+    println("PASS backoff cresce por tentativa com jitter dentro do limite")
+}
+
+void checkJitterSpread(JobStore store) {
+    var index = 0
+    var distinct = false
+    var firstValue = 0L
+    while (index < 8) {
+        var id = store.enqueue("jitter", "p", 2)
+        var job = store.claim("jitter", 3000L, 100L).get(0)
+        assert(store.fail(job, "falha", 3001L))
+        var due = store.get(id).available_at
+        assert(due >= 3001L + 1000L)
+        assert(due <= 3001L + 1000L + 200L)
+        if (index == 0) {
+            firstValue = due
+        } else if (due != firstValue) {
+            distinct = true
+        }
+        index = index + 1
+    }
+    assert(distinct, "o jitter precisa dispersar jobs distintos, não colocar todos no mesmo instante")
+    println("PASS jitter descorrelaciona jobs distintos dentro do limite")
+}
+
+void checkClockLimits(JobStore store) {
+    var id = store.enqueue("limits", "p", 2)
+    var job = store.claim("limits", 9223372036768375807L - 1000L, 86400000L).get(0)
+    assert(store.fail(job, "no limite do relógio", 9223372036768375807L))
+    assert(store.get(id).available_at > 0L, "soma temporal não pode estourar")
+    expectFailure(() -> { store.succeed(job, -1L); return true })
+    expectFailure(() -> { store.fail(job, "x", 9223372036854775807L); return true })
+    println("PASS limites do relógio no agendamento da reentrega")
+}
+
+void createLegacySchema(String conn) {
+    db.execute(conn, "CREATE TABLE jobs (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, kind TEXT NOT NULL CHECK(length(kind) BETWEEN 1 AND 200), payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running','succeeded','failed')), attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0 AND attempts <= max_attempts), max_attempts INTEGER NOT NULL CHECK(max_attempts BETWEEN 1 AND 1000), lease_until INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', CHECK((status = 'running' AND lease_until > 0 AND attempts > 0) OR (status != 'running' AND lease_until = 0)))")
+    db.execute(conn, "CREATE INDEX jobs_pending ON jobs(kind, status, seq)")
+    db.execute(conn, "CREATE INDEX jobs_expired ON jobs(kind, status, lease_until)")
+    db.execute(conn, "INSERT INTO jobs(id, kind, payload, max_attempts) VALUES ('antigo-pendente', 'legado', 'payload preservado', 3)")
+    db.execute(conn, "INSERT INTO jobs(id, kind, payload, status, attempts, max_attempts, lease_until, last_error) VALUES ('antigo-executando', 'legado', 'em execução', 'running', 1, 3, 4000, 'erro anterior')")
+    db.execute(conn, "PRAGMA user_version = 1")
+    db.execute(conn, "PRAGMA application_id = 1263488844")
+}
+
+void checkMigration() {
+    var path = config.env("TEST_DB") + ".v1"
+    var legacy = db.connect("jdbc:sqlite:" + path)
+    try {
+        createLegacySchema(legacy)
+    } finally {
+        db.close(legacy)
+    }
+
+    var store = JobStore(path)
+    var pending = store.get("antigo-pendente")
+    assert(pending.payload == "payload preservado", "migração não pode perder payload")
+    assert(pending.status == "pending")
+    assert(pending.max_attempts == 3)
+    assert(pending.available_at == 0L, "job migrado continua elegível imediatamente")
+    var running = store.get("antigo-executando")
+    assert(running.status == "running")
+    assert(running.attempts == 1)
+    assert(running.lease_until == 4000L)
+    assert(running.last_error == "erro anterior")
+
+    assert(store.attempts("antigo-pendente").size == 0, "tentativa que nunca houve não é inventada")
+    var open = store.attempts("antigo-executando")
+    assert(open.size == 1)
+    assert(open.get(0).attempt == 1)
+    assert(open.get(0).started_at == 0L, "início desconhecido nas tentativas migradas")
+    assert(open.get(0).result == "running")
+
+    var claimed = store.claim("legado", 1000L, 100L).get(0)
+    assert(claimed.id == "antigo-pendente", "job migrado continua reivindicável")
+    assert(store.succeed(claimed, 1001L))
+    var recovered = store.claim("legado", 4000L, 100L).get(0)
+    assert(recovered.id == "antigo-executando")
+    assert(recovered.attempts == 2)
+    var afterRecovery = store.attempts("antigo-executando")
+    assert(afterRecovery.size == 2)
+    assert(afterRecovery.get(0).result == "expired", "tentativa migrada expira como qualquer outra")
+
+    var check = db.connect("jdbc:sqlite:" + path)
+    try {
+        assert(db.query<Version>(check, "PRAGMA user_version").get(0).user_version == 2)
+    } finally {
+        db.close(check)
+    }
+    println("PASS migração v1 para v2 preserva jobs, estados e elegibilidade")
+}
+
+void checkSchemaParity() {
+    var migratedPath = config.env("TEST_DB") + ".parity-v1"
+    var legacy = db.connect("jdbc:sqlite:" + migratedPath)
+    try {
+        createLegacySchema(legacy)
+    } finally {
+        db.close(legacy)
+    }
+    var migrated = JobStore(migratedPath)
+    var freshPath = config.env("TEST_DB") + ".parity-v2"
+    var fresh = JobStore(freshPath)
+    assert(migrated.get("antigo-pendente").available_at == 0L)
+    assert(fresh.attempts(fresh.enqueue("parity", "p", 1)).size == 0)
+    assertSameColumns(migratedPath, freshPath, "jobs")
+    assertSameColumns(migratedPath, freshPath, "job_attempts")
+    rejectsInvalidWrites(migratedPath)
+    rejectsInvalidWrites(freshPath)
+    println("PASS schema migrado bate com o criado do zero em colunas, defaults, PK, índices e restrições")
+}
+
+void assertSameColumns(String pathA, String pathB, String table) {
+    var connA = db.connect("jdbc:sqlite:" + pathA)
+    var connB = db.connect("jdbc:sqlite:" + pathB)
+    try {
+        var columnsA = db.query<ColumnInfo>(connA, "SELECT cid, name, type, [notnull] AS not_null, COALESCE(dflt_value, '') AS dflt, pk FROM pragma_table_info(?) ORDER BY cid", table)
+        var columnsB = db.query<ColumnInfo>(connB, "SELECT cid, name, type, [notnull] AS not_null, COALESCE(dflt_value, '') AS dflt, pk FROM pragma_table_info(?) ORDER BY cid", table)
+        assert(columnsA.size == columnsB.size, "número de colunas precisa coincidir")
+        assert(columnsA.size > 0)
+        var index = 0
+        while (index < columnsA.size) {
+            assert(columnsA.get(index).name == columnsB.get(index).name, "nome e ordem das colunas")
+            assert(columnsA.get(index).type == columnsB.get(index).type, "tipo das colunas")
+            assert(columnsA.get(index).not_null == columnsB.get(index).not_null, "obrigatoriedade das colunas")
+            assert(columnsA.get(index).dflt == columnsB.get(index).dflt, "valor padrão das colunas")
+            assert(columnsA.get(index).pk == columnsB.get(index).pk, "chave primária")
+            index = index + 1
+        }
+        var indexesA = db.query<IndexInfo>(connA, "SELECT name, [unique] AS is_unique FROM pragma_index_list(?) ORDER BY name", table)
+        var indexesB = db.query<IndexInfo>(connB, "SELECT name, [unique] AS is_unique FROM pragma_index_list(?) ORDER BY name", table)
+        assert(indexesA.size == indexesB.size, "quantidade de índices")
+        var pos = 0
+        while (pos < indexesA.size) {
+            assert(indexesA.get(pos).name == indexesB.get(pos).name, "nome dos índices")
+            assert(indexesA.get(pos).is_unique == indexesB.get(pos).is_unique, "unicidade dos índices")
+            var colsA = db.query<IndexColumn>(connA, "SELECT seqno, name FROM pragma_index_info(?) ORDER BY seqno", indexesA.get(pos).name)
+            var colsB = db.query<IndexColumn>(connB, "SELECT seqno, name FROM pragma_index_info(?) ORDER BY seqno", indexesB.get(pos).name)
+            assert(colsA.size == colsB.size, "quantidade de colunas do índice")
+            var col = 0
+            while (col < colsA.size) {
+                assert(colsA.get(col).name == colsB.get(col).name, "colunas e ordem do índice")
+                col = col + 1
+            }
+            pos = pos + 1
+        }
+    } finally {
+        db.close(connA)
+        db.close(connB)
+    }
+}
+
+void checkMigrationFailure() {
+    var path = config.env("TEST_DB") + ".v1-bloqueado"
+    var legacy = db.connect("jdbc:sqlite:" + path)
+    try {
+        createLegacySchema(legacy)
+        db.execute(legacy, "CREATE TABLE job_attempts(conflito INTEGER)")
+    } finally {
+        db.close(legacy)
+    }
+    expectFailure(() -> { JobStore(path); return true })
+    var check = db.connect("jdbc:sqlite:" + path)
+    try {
+        assert(db.query<Version>(check, "PRAGMA user_version").get(0).user_version == 1, "migração falha deixa o banco na v1")
+        var columns = db.query<ColumnInfo>(check, "SELECT cid, name, type, [notnull] AS not_null, pk FROM pragma_table_info('jobs')")
+        var index = 0
+        var hasAvailable = false
+        while (index < columns.size) {
+            if (columns.get(index).name == "available_at") {
+                hasAvailable = true
+            }
+            index = index + 1
+        }
+        assert(!hasAvailable, "coluna nova não pode sobreviver a uma migração abortada")
+        assert(db.query(check, "SELECT * FROM jobs").size == 2, "jobs preservados após migração abortada")
+    } finally {
+        db.close(check)
+    }
+    println("PASS migração abortada preserva o banco na versão anterior")
+}
+
+void checkHistoryRollback(JobStore store) {
+    var id = store.enqueue("coerencia", "p", 3)
+    var job = store.claim("coerencia", 6000L, 100L).get(0)
+    var conn = db.connect("jdbc:sqlite:" + config.env("TEST_DB"))
+    try {
+        db.execute(conn, "CREATE TRIGGER reject_attempt_close BEFORE UPDATE ON job_attempts WHEN NEW.result = 'succeeded' BEGIN SELECT RAISE(ABORT, 'histórico rejeitado'); END")
+        expectFailure(() -> { store.succeed(job, 6001L); return true })
+        assert(store.get(id).status == "running", "estado não pode avançar sem o histórico")
+        assert(store.attempts(id).get(0).result == "running")
+        db.execute(conn, "DROP TRIGGER reject_attempt_close")
+    } finally {
+        db.close(conn)
+    }
+    assert(store.succeed(job, 6002L))
+    assert(store.get(id).status == "succeeded")
+    assert(store.attempts(id).get(0).result == "succeeded")
+    println("PASS estado e histórico avançam juntos ou não avançam")
+}
+
+void checkIgnoredSchedule(JobStore store) {
+    var id = store.enqueue("ignora-espera", "p", 3)
+    var job = store.claim("ignora-espera", 7000L, 100L).get(0)
+    var conn = db.connect("jdbc:sqlite:" + config.env("TEST_DB"))
+    try {
+        db.execute(conn, "CREATE TRIGGER ignore_schedule BEFORE UPDATE OF available_at ON jobs BEGIN SELECT RAISE(IGNORE); END")
+        expectFailure(() -> { store.fail(job, "reagendamento ignorado", 7001L); return true })
+        assert(store.get(id).status == "running", "rollback preserva a tentativa em execução")
+        assert(store.get(id).attempts == 1)
+        assert(store.get(id).available_at == 0L)
+        assert(store.attempts(id).get(0).result == "running", "tentativa não pode ser fechada pelo rollback")
+        db.execute(conn, "DROP TRIGGER ignore_schedule")
+    } finally {
+        db.close(conn)
+    }
+    assert(store.fail(job, "falha real", 7002L))
+    assert(store.get(id).available_at >= 7002L + 1000L, "a espera do retry precisa ficar persistida")
+    assert(store.attempts(id).get(0).result == "failed")
+    println("PASS reagendamento ignorado aborta a confirmação da falha")
+}
+
+void checkIgnoredExpiry(JobStore store) {
+    var id = store.enqueue("ignora-expiracao", "p", 3)
+    store.claim("ignora-expiracao", 8000L, 100L)
+    var conn = db.connect("jdbc:sqlite:" + config.env("TEST_DB"))
+    try {
+        db.execute(conn, "CREATE TRIGGER ignore_expiry BEFORE UPDATE OF result ON job_attempts BEGIN SELECT RAISE(IGNORE); END")
+        expectFailure(() -> { store.claim("ignora-expiracao", 8100L, 100L); return true })
+        assert(store.get(id).status == "running", "recuperação incoerente não pode ser confirmada")
+        assert(store.get(id).attempts == 1)
+        var rows = store.attempts(id)
+        assert(rows.size == 1, "nenhuma tentativa nova pode ser aberta na recuperação abortada")
+        assert(rows.get(0).result == "running")
+        db.execute(conn, "DROP TRIGGER ignore_expiry")
+    } finally {
+        db.close(conn)
+    }
+    var recovered = store.claim("ignora-expiracao", 8200L, 100L).get(0)
+    assert(recovered.attempts == 2)
+    var depois = store.attempts(id)
+    assert(depois.size == 2)
+    assert(depois.get(0).result == "expired")
+    assert(depois.get(1).result == "running")
+    println("PASS expiração ignorada aborta a recuperação inteira")
+}
+
+void checkBackoffCeiling(JobStore store) {
+    var id = store.enqueue("teto", "p", 20)
+    var clock = 10000L
+    var attempt = 1
+    var last = 0L
+    while (attempt <= 14) {
+        var job = store.claim("teto", clock, 100L).get(0)
+        assert(job.attempts == attempt)
+        assert(store.fail(job, "falha", clock + 1L))
+        var due = store.get(id).available_at
+        last = due - (clock + 1L)
+        clock = due
+        attempt = attempt + 1
+    }
+    assert(last >= 3600000L, "o atraso precisa alcançar o teto de uma hora")
+    assert(last <= 3600000L + 720000L, "o teto limita atraso e jitter")
+    println("PASS atraso alcança o teto de uma hora sem ultrapassá-lo")
+}
+
+void checkRecoveryOfManyJobs(JobStore store) {
+    var a = store.enqueue("varios", "a", 3)
+    var b = store.enqueue("varios", "b", 3)
+    var c = store.enqueue("varios", "c", 1)
+    store.claim("varios", 20000L, 100L)
+    store.claim("varios", 20000L, 100L)
+    store.claim("varios", 20000L, 100L)
+    var granted = store.claim("varios", 20100L, 100L).get(0)
+    assert(granted.id == a, "o mais antigo elegível é reivindicado após a recuperação")
+    assert(granted.attempts == 2)
+    assert(store.attempts(a).get(0).result == "expired")
+    assert(store.attempts(a).size == 2)
+    assert(store.attempts(b).size == 1)
+    assert(store.attempts(b).get(0).result == "expired", "todo job expirado fecha sua própria tentativa")
+    assert(store.get(b).status == "pending")
+    assert(store.attempts(c).get(0).result == "expired")
+    assert(store.get(c).status == "failed", "orçamento esgotado durante a recuperação encerra o job")
+    println("PASS recuperação de vários jobs fecha o histórico de cada um")
+}
+
+void checkRecoveryMismatch(JobStore store) {
+    var a = store.enqueue("divergente", "a", 3)
+    var b = store.enqueue("divergente", "b", 3)
+    store.claim("divergente", 21000L, 100L)
+    store.claim("divergente", 21000L, 100L)
+    var conn = db.connect("jdbc:sqlite:" + config.env("TEST_DB"))
+    try {
+        db.execute(conn, "CREATE TRIGGER ignora_hist_a BEFORE UPDATE OF result ON job_attempts WHEN OLD.job_id = (SELECT id FROM jobs WHERE kind = 'divergente' AND payload = 'a') BEGIN SELECT RAISE(IGNORE); END")
+        db.execute(conn, "CREATE TRIGGER ignora_estado_b BEFORE UPDATE ON jobs WHEN OLD.kind = 'divergente' AND OLD.payload = 'b' AND NEW.status <> 'running' BEGIN SELECT RAISE(IGNORE); END")
+        expectFailure(() -> { store.claim("divergente", 21100L, 100L); return true })
+        assert(store.get(a).status == "running", "nenhum job pode ser recuperado na divergência")
+        assert(store.get(a).attempts == 1)
+        assert(store.attempts(a).size == 1)
+        assert(store.attempts(a).get(0).result == "running")
+        assert(store.get(b).status == "running")
+        assert(store.attempts(b).get(0).result == "running", "o histórico de B não pode ser fechado sozinho")
+        db.execute(conn, "DROP TRIGGER ignora_hist_a")
+        db.execute(conn, "DROP TRIGGER ignora_estado_b")
+    } finally {
+        db.close(conn)
+    }
+    var recovered = store.claim("divergente", 21200L, 100L).get(0)
+    assert(recovered.id == a)
+    assert(recovered.attempts == 2)
+    assert(store.attempts(b).get(0).result == "expired")
+    println("PASS divergência entre jobs recuperados e histórico aborta a recuperação")
+}
+
+void checkRecoverySilentFailure(JobStore store) {
+    var id = store.enqueue("silencioso", "p", 3)
+    store.claim("silencioso", 22000L, 100L)
+    var conn = db.connect("jdbc:sqlite:" + config.env("TEST_DB"))
+    try {
+        db.execute(conn, "CREATE TRIGGER ignora_hist_tudo BEFORE UPDATE OF result ON job_attempts BEGIN SELECT RAISE(IGNORE); END")
+        db.execute(conn, "CREATE TRIGGER ignora_estado_tudo BEFORE UPDATE ON jobs WHEN NEW.status <> 'running' BEGIN SELECT RAISE(IGNORE); END")
+        expectFailure(() -> { store.claim("silencioso", 22100L, 100L); return true })
+        assert(store.get(id).status == "running", "falha de escrita não pode virar ausência de trabalho")
+        assert(store.attempts(id).size == 1)
+        db.execute(conn, "DROP TRIGGER ignora_hist_tudo")
+        db.execute(conn, "DROP TRIGGER ignora_estado_tudo")
+    } finally {
+        db.close(conn)
+    }
+    assert(store.claim("silencioso", 22200L, 100L).get(0).attempts == 2)
+    println("PASS recuperação totalmente ignorada não é confundida com fila vazia")
+}
+
+void checkRecoveryWithoutHistory(JobStore store) {
+    var id = store.enqueue("sem-historico", "p", 3)
+    store.claim("sem-historico", 23000L, 100L)
+    var conn = db.connect("jdbc:sqlite:" + config.env("TEST_DB"))
+    try {
+        db.execute(conn, "DELETE FROM job_attempts WHERE job_id = ?", id)
+        assert(store.attempts(id).size == 0)
+        expectFailure(() -> { store.claim("sem-historico", 23100L, 100L); return true })
+        assert(store.get(id).status == "running", "histórico ausente impede recuperação silenciosa")
+        assert(store.get(id).attempts == 1)
+    } finally {
+        db.close(conn)
+    }
+    println("PASS histórico ausente aborta a recuperação")
+}
+
+void checkJitterDeterminism() {
+    var first = config.env("TEST_DB") + ".jitter-a"
+    var second = config.env("TEST_DB") + ".jitter-b"
+    var dueFirst = scheduleFixedJob(first)
+    var dueSecond = scheduleFixedJob(second)
+    assert(dueFirst == dueSecond, "o mesmo par id/tentativa precisa produzir sempre o mesmo instante")
+    assert(dueFirst >= 1001L + 1000L)
+    assert(dueFirst <= 1001L + 1000L + 200L)
+    println("PASS jitter é determinístico para o mesmo job e tentativa")
+}
+
+Long scheduleFixedJob(String path) {
+    var store = JobStore(path)
+    var conn = db.connect("jdbc:sqlite:" + path)
+    try {
+        db.execute(conn, "INSERT INTO jobs(id, kind, payload, max_attempts) VALUES ('determinismo-fixo', 'det', 'p', 3)")
+    } finally {
+        db.close(conn)
+    }
+    var job = store.claim("det", 1000L, 100L).get(0)
+    assert(store.fail(job, "falha", 1001L))
+    return store.get("determinismo-fixo").available_at
+}
+
+void rejectsInvalidWrites(String path) {
+    var conn = db.connect("jdbc:sqlite:" + path)
+    try {
+        expectFailure(() -> { db.execute(conn, "INSERT INTO jobs(id, kind, payload, max_attempts) VALUES ('ck1', '', 'p', 1)"); return true })
+        expectFailure(() -> { db.execute(conn, "INSERT INTO jobs(id, kind, payload, max_attempts) VALUES ('ck2', 'k', 'p', 0)"); return true })
+        expectFailure(() -> { db.execute(conn, "INSERT INTO jobs(id, kind, payload, max_attempts) VALUES ('ck3', 'k', 'p', 1001)"); return true })
+        expectFailure(() -> { db.execute(conn, "INSERT INTO jobs(id, kind, payload, status, max_attempts) VALUES ('ck4', 'k', 'p', 'desconhecido', 1)"); return true })
+        expectFailure(() -> { db.execute(conn, "INSERT INTO jobs(id, kind, payload, attempts, max_attempts) VALUES ('ck5', 'k', 'p', -1, 1)"); return true })
+        expectFailure(() -> { db.execute(conn, "INSERT INTO jobs(id, kind, payload, attempts, max_attempts) VALUES ('ck6', 'k', 'p', 2, 1)"); return true })
+        expectFailure(() -> { db.execute(conn, "INSERT INTO jobs(id, kind, payload, status, attempts, max_attempts, lease_until) VALUES ('ck7', 'k', 'p', 'running', 1, 1, 0)"); return true })
+        expectFailure(() -> { db.execute(conn, "INSERT INTO jobs(id, kind, payload, status, max_attempts, lease_until) VALUES ('ck8', 'k', 'p', 'pending', 1, 5)"); return true })
+        expectFailure(() -> { db.execute(conn, "INSERT INTO job_attempts(job_id, attempt, started_at) VALUES ('ck9', 0, 1)"); return true })
+        expectFailure(() -> { db.execute(conn, "INSERT INTO job_attempts(job_id, attempt, started_at) VALUES ('ck10', 1, -1)"); return true })
+        expectFailure(() -> { db.execute(conn, "INSERT INTO job_attempts(job_id, attempt, started_at, finished_at, result) VALUES ('ck11', 1, 1, 2, 'desconhecido')"); return true })
+        expectFailure(() -> { db.execute(conn, "INSERT INTO job_attempts(job_id, attempt, started_at, finished_at) VALUES ('ck12', 1, 1, 5)"); return true })
+        assert(db.query(conn, "SELECT * FROM jobs WHERE id LIKE 'ck%'").size == 0, "nenhuma escrita inválida pode ter passado")
+        assert(db.query(conn, "SELECT * FROM job_attempts WHERE job_id LIKE 'ck%'").size == 0)
+    } finally {
+        db.close(conn)
+    }
+}
+

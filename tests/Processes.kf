@@ -41,7 +41,14 @@ void recoverClaim(JobStore store) {
             var job = rows.get(0)
             assert(job.attempts == 2)
             assert(job.payload == "persistido em outro processo")
+            var history = store.attempts(job.id)
+            assert(history.size == 2, "a tentativa morta e a nova precisam estar registradas")
+            assert(history.get(0).result == "expired", "a tentativa do processo morto expira, não falha")
+            assert(history.get(1).result == "running")
             assert(store.succeed(job, time.now()))
+            var closed = store.attempts(job.id)
+            assert(closed.get(1).result == "succeeded")
+            assert(closed.get(0).result == "expired", "o histórico anterior não é reescrito")
             println("RECOVERED " + job.id)
             recovered = true
         } else {
@@ -62,12 +69,17 @@ void raceClaim(JobStore store) {
 }
 
 void verifyRace() {
+    var store = JobStore(config.env("TEST_DB"))
     var conn = db.connect("jdbc:sqlite:" + config.env("TEST_DB"))
     var rows = db.query<koflow.Job>(conn, "SELECT * FROM jobs")
     assert(rows.size == 1)
     assert(rows.get(0).status == "running")
     assert(rows.get(0).attempts == 1)
     db.close(conn)
+    var history = store.attempts(rows.get(0).id)
+    assert(history.size == 1, "oito processos não podem gerar mais de uma tentativa")
+    assert(history.get(0).attempt == 1)
+    assert(history.get(0).result == "running")
 }
 
 void holdUncommitted() {
