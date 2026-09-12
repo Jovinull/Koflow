@@ -27,10 +27,12 @@ asserções são escritos em Kof.
 ## O que já funciona
 
 - **Persistência:** jobs e payloads sobrevivem ao encerramento do processo.
-- **Retries limitados:** falhas podem ser repetidas até o orçamento de tentativas.
+- **Histórico durável:** cada tentativa fica registrada com início, fim, resultado e erro.
+- **Retries com espera:** uma falha agenda a próxima tentativa com atraso crescente.
+- **Execução pontual futura:** um job pode ser enfileirado para não rodar antes de um instante.
 - **Recuperação:** uma execução interrompida volta a ficar disponível após expirar seu prazo.
 - **Controle de posse:** confirmações de tentativas antigas são rejeitadas.
-- **Inspeção simples:** consulte estado, tentativas e último erro pelo ID do job.
+- **Inspeção:** consulte o estado atual e a sequência de tentativas pelo ID do job.
 
 O projeto é **experimental**. A recuperação foi testada com `SIGKILL` e a disputa
 por um job foi exercitada entre oito processos, nos dois ambientes validados.
@@ -41,9 +43,9 @@ Veja o [contrato de execução](#contrato-de-execução).
 
 | Estágio | Conteúdo |
 | --- | --- |
-| **Hoje** | Jobs persistentes locais: enqueue, concessão de execução, retries limitados, recuperação após crash e disputa entre processos. Experimental. |
-| **Próximo** | Backoff e execução pontual futura; filas explícitas e ciclo de vida de workers. Planejado, ainda não implementado. |
-| **Direção** | Histórico durável de execução, workflows e DAGs, ferramental de operação e workers remotos. |
+| **Hoje** | Jobs persistentes locais: enqueue imediato ou para um instante futuro, concessão de execução, retries com espera crescente, histórico durável das tentativas, recuperação após crash e disputa entre processos. Experimental. |
+| **Próximo** | Filas explícitas e ciclo de vida de workers. Planejado, ainda não implementado. |
+| **Direção** | Workflows e DAGs, ferramental de operação e workers remotos. |
 
 Apenas a linha "Hoje" existe no código. As demais indicam para onde o runtime cresce,
 não o que ele já faz.
@@ -107,7 +109,9 @@ processos e recuperação após `SIGKILL`. `make demo` inicia um produtor e um
 consumidor em processos separados, usando um banco temporário removido ao final.
 
 Para usar instalações próprias, configure `KOF`, `JAVA` e `SQLITE_JDBC` com
-caminhos absolutos. O driver deve estar no classpath da aplicação. Os scripts
+caminhos absolutos. No Git Bash, use a forma POSIX (`/c/Users/...`): os scripts montam
+o classpath separado por `:`, e um caminho com letra de unidade (`C:/Users/...`) é
+interpretado como dois caminhos, resultando em `ClassNotFoundException`. O driver deve estar no classpath da aplicação. Os scripts
 já configuram esse classpath; `kofdeps` declara a dependência para outros builds.
 
 ## Exemplo persistente
@@ -156,16 +160,24 @@ separa produção, consumo e consulta.
 - `enqueue(kind, payload, maxAttempts)` retorna um UUID depois de persistir o job.
   O payload é texto opaco; a aplicação pode usar JSON. O nome `kind` identifica
   o handler e pode incluir uma versão, como `report.v1`.
+- `enqueueAt(kind, payload, maxAttempts, availableAt)` enfileira para execução não
+  antes de `availableAt`, em milissegundos desde a época. Não existe recorrência:
+  o job roda uma vez, como qualquer outro.
 - `Worker(store, kind, leaseMillis)` executa um handler por chamada a `runOnce`.
   `false` significa que nenhum job estava disponível; `true` significa que uma
   tentativa foi tratada, inclusive quando o handler falhou. Consulte `get(id)`
   para saber o resultado.
 - Estados: `pending`, `running`, `succeeded` e `failed`. O contador começa em zero
   e aumenta em cada concessão confirmada. Erros de handler voltam a `pending`
-  imediatamente, até o limite de 1 a 1000 tentativas; depois viram `failed`.
-- A seleção respeita a ordem de inserção dos jobs disponíveis do mesmo `kind`.
-  Um job que falha pode ser selecionado novamente antes dos seguintes. Jobs de
-  nomes sem consumidor permanecem pendentes.
+  até o limite de 1 a 1000 tentativas; depois viram `failed`.
+- Um job só é elegível quando `available_at` já passou. Uma falha com orçamento
+  restante agenda a próxima tentativa para `agora + atraso`, com o atraso dobrando a
+  cada tentativa a partir de 1 s, limitado a 1 h, mais uma dispersão de até 20% para
+  que jobs diferentes não retornem todos no mesmo instante.
+- Uma concessão expirada **não** recebe atraso: o prazo vencido já foi a espera.
+- A seleção respeita a ordem de inserção entre os jobs elegíveis do mesmo `kind`.
+  Um job agendado para o futuro não é escolhido antes do instante, mesmo sendo o mais
+  antigo. Jobs de nomes sem consumidor permanecem pendentes.
 - Uma tentativa tem uma concessão de execução (*lease*) entre 1 ms e 24 h.
   Na expiração, a próxima chamada de claim para aquele `kind` recupera o job ou
   o encerra se o limite de tentativas foi atingido. Uma queda depois do claim
@@ -193,6 +205,27 @@ uma nova tentativa. O relógio deve ser consistente entre os processos do mesmo 
 | `claim(kind, now, leaseMillis)` | Lista com zero ou um `Job`, com número da tentativa e prazo persistidos. |
 | `succeed(job, now)` | `true` se confirmou sucesso; `false` se a concessão não é mais válida. |
 | `fail(job, error, now)` | `true` se registrou falha/retry; `false` se a concessão não é mais válida. |
+| `attempts(id)` | Histórico do job, em ordem de tentativa; lança erro se o job não existir. |
+
+Cada tentativa vira uma linha de histórico no mesmo instante em que o estado do job
+muda, com `started_at`, `finished_at`, `error` e um `result`:
+
+| `result` | Significado |
+| --- | --- |
+| `running` | Concedida e ainda sem confirmação válida. |
+| `succeeded` | O handler confirmou sucesso dentro do prazo. |
+| `failed` | O handler falhou e a falha foi confirmada dentro do prazo. |
+| `expired` | A concessão venceu sem confirmação. |
+
+`expired` não é `failed`: o runtime sabe que a tentativa foi concedida e não confirmada,
+mas não sabe se o efeito externo chegou a acontecer. O esgotamento do orçamento aparece
+no job (`status` igual a `failed`), não como resultado de tentativa.
+
+```kof
+for (var attempt in jobs.attempts(id)) {
+    println(attempt.attempt + " " + attempt.result + " " + attempt.error)
+}
+```
 
 `now` usa milissegundos desde Unix epoch (`Long`); o Worker fornece `time.now()`.
 Os snapshots não são atualizados em memória: consulte novamente para ler mudanças.
@@ -206,11 +239,19 @@ usa `synchronous=FULL`, espera até 5 segundos por locks e recusa identidade ou
 versão de schema incompatível. O diretório pai deve existir. Não use `:memory:`,
 URI `file:`, compartilhamento de rede ou o mesmo arquivo de outro sistema.
 
-Esta versão não inclui cron, agendamento futuro, backoff, heartbeat, cancelamento,
+Esta versão não inclui cron, recorrência, prioridade, heartbeat, cancelamento,
 timeout preemptivo, pool gerenciado, servidor, dashboard, DAGs ou workflows duráveis.
-Não remove jobs automaticamente e mantém apenas o último erro, sem histórico
-completo de tentativas. A disputa de claims entre processos é testada; outros
-backends Kof e falhas físicas de disco ou energia não foram validados.
+O agendamento é pontual: um job roda uma vez. O atraso entre tentativas é fixo em
+contrato, não configurável. Jobs e histórico não são removidos automaticamente — não há
+política de retenção. A disputa de claims entre processos é testada; outros backends Kof
+e falhas físicas de disco ou energia não foram validados.
+
+Bancos criados por versões anteriores são migrados na abertura, dentro de uma transação:
+a coluna de elegibilidade entra com valor neutro e nenhum job é reescrito. As tentativas
+concluídas antes da migração não aparecem no histórico, porque nunca foram registradas.
+A exceção é o job que estava em execução no momento da migração: ele recebe a linha da
+tentativa vigente, necessária para que a confirmação ou a expiração dela funcionem, com
+`started_at` igual a `0` indicando **início desconhecido** — não um início na época.
 
 ## Encontrou um problema?
 
