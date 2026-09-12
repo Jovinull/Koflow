@@ -1,4 +1,5 @@
 import koflow.Job
+import koflow.JobAttempt
 import koflow.JobStore
 import koflow.JobHandler
 import koflow.Worker

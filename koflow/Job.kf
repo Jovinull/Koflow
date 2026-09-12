@@ -1,4 +1,5 @@
 package koflow
 
 record Job(String id, String kind, String payload, String status,
-    Int attempts, Int max_attempts, Long lease_until, String last_error)
+    Int attempts, Int max_attempts, Long lease_until, String last_error,
+    Long available_at)

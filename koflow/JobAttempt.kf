@@ -1,0 +1,4 @@
+package koflow
+
+record JobAttempt(String job_id, Int attempt, Long started_at, Long finished_at,
+    String result, String error)

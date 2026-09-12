@@ -1,6 +1,7 @@
 package koflow
 
 import koflow.Job
+import koflow.JobAttempt
 
 record SchemaVersion(Int user_version)
 record JournalMode(String journal_mode)
@@ -51,15 +52,14 @@ class JobStore {
                 if (tables.get(0).count != 0 || application != 0) {
                     throw "O arquivo precisa ser um banco dedicado ao Koflow"
                 }
-                db.execute(conn, "CREATE TABLE jobs (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, kind TEXT NOT NULL CHECK(length(kind) BETWEEN 1 AND 200), payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running','succeeded','failed')), attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0 AND attempts <= max_attempts), max_attempts INTEGER NOT NULL CHECK(max_attempts BETWEEN 1 AND 1000), lease_until INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', CHECK((status = 'running' AND lease_until > 0 AND attempts > 0) OR (status != 'running' AND lease_until = 0)))")
-                db.execute(conn, "CREATE INDEX jobs_pending ON jobs(kind, status, seq)")
-                db.execute(conn, "CREATE INDEX jobs_expired ON jobs(kind, status, lease_until)")
-                db.execute(conn, "PRAGMA user_version = 1")
-                db.execute(conn, "PRAGMA application_id = 1263488844")
-            } else if (version != 1 || application != 1263488844) {
+                this.createSchema(conn)
+            } else if (version == 1 && application == 1263488844) {
+                this.migrate(conn)
+            } else if (version != 2 || application != 1263488844) {
                 throw "Versão de schema não suportada"
             }
-            db.query<koflow.Job>(conn, "SELECT id, kind, payload, status, attempts, max_attempts, lease_until, last_error FROM jobs LIMIT 0")
+            db.query<koflow.Job>(conn, "SELECT id, kind, payload, status, attempts, max_attempts, lease_until, last_error, available_at FROM jobs LIMIT 0")
+            db.query<koflow.JobAttempt>(conn, "SELECT job_id, attempt, started_at, finished_at, result, error FROM job_attempts LIMIT 0")
             db.execute(conn, "COMMIT")
             committed = true
         } finally {
@@ -73,21 +73,70 @@ class JobStore {
         }
     }
 
+    private void createSchema(String conn) {
+        db.execute(conn, "CREATE TABLE jobs (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, kind TEXT NOT NULL CHECK(length(kind) BETWEEN 1 AND 200), payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running','succeeded','failed')), attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0 AND attempts <= max_attempts), max_attempts INTEGER NOT NULL CHECK(max_attempts BETWEEN 1 AND 1000), lease_until INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', available_at INTEGER NOT NULL DEFAULT 0, CHECK((status = 'running' AND lease_until > 0 AND attempts > 0) OR (status != 'running' AND lease_until = 0)))")
+        db.execute(conn, "CREATE INDEX jobs_pending ON jobs(kind, status, seq)")
+        db.execute(conn, "CREATE INDEX jobs_expired ON jobs(kind, status, lease_until)")
+        this.createAttempts(conn)
+        db.execute(conn, "PRAGMA user_version = 2")
+        db.execute(conn, "PRAGMA application_id = 1263488844")
+    }
+
+    private void createAttempts(String conn) {
+        db.execute(conn, "CREATE TABLE job_attempts (seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, attempt INTEGER NOT NULL CHECK(attempt > 0), started_at INTEGER NOT NULL CHECK(started_at >= 0), finished_at INTEGER NOT NULL DEFAULT 0, result TEXT NOT NULL DEFAULT 'running' CHECK(result IN ('running','succeeded','failed','expired')), error TEXT NOT NULL DEFAULT '', UNIQUE(job_id, attempt), CHECK((result = 'running' AND finished_at = 0) OR (result <> 'running' AND finished_at >= 0)))")
+    }
+
+    private void migrate(String conn) {
+        db.execute(conn, "ALTER TABLE jobs ADD COLUMN available_at INTEGER NOT NULL DEFAULT 0")
+        this.createAttempts(conn)
+        db.execute(conn, "INSERT INTO job_attempts(job_id, attempt, started_at) SELECT id, attempts, 0 FROM jobs WHERE status = 'running'")
+        db.execute(conn, "PRAGMA user_version = 2")
+    }
+
     public String enqueue(String kind, String payload, Int maxAttempts) {
+        return this.insert(kind, payload, maxAttempts, 0L)
+    }
+
+    public String enqueueAt(String kind, String payload, Int maxAttempts, Long availableAt) {
+        if (availableAt < 0 || availableAt > 9223372036768375807L) {
+            throw "Instante de disponibilidade inválido"
+        }
+        return this.insert(kind, payload, maxAttempts, availableAt)
+    }
+
+    private String insert(String kind, String payload, Int maxAttempts, Long availableAt) {
         this.validateKind(kind)
         if (maxAttempts < 1 || maxAttempts > 1000) {
             throw "maxAttempts deve estar entre 1 e 1000"
         }
         var id = uuid.v4()
         var conn = this.connect()
+        var started = false
+        var committed = false
         try {
+            db.execute(conn, "BEGIN IMMEDIATE")
+            started = true
             var inserted = db.execute(conn, "INSERT INTO jobs(id, kind, payload, max_attempts) VALUES (?, ?, ?, ?)", id, kind, payload, maxAttempts)
             if (inserted != 1) {
                 throw "Job não foi persistido"
             }
+            if (availableAt > 0L) {
+                var scheduled = db.execute(conn, "UPDATE jobs SET available_at = ? WHERE id = ?", availableAt, id)
+                if (scheduled != 1) {
+                    throw "Job não foi agendado"
+                }
+            }
+            db.execute(conn, "COMMIT")
+            committed = true
             return id
         } finally {
-            db.close(conn)
+            try {
+                if (started && !committed) {
+                    db.execute(conn, "ROLLBACK")
+                }
+            } finally {
+                db.close(conn)
+            }
         }
     }
 
@@ -104,6 +153,22 @@ class JobStore {
         }
     }
 
+    public List<JobAttempt> attempts(String id) {
+        var conn = this.connect()
+        try {
+            var rows = db.query<koflow.JobAttempt>(conn, "SELECT job_id, attempt, started_at, finished_at, result, error FROM job_attempts WHERE job_id = ? ORDER BY attempt", id)
+            if (rows.size == 0) {
+                var jobs = db.query<koflow.Job>(conn, "SELECT * FROM jobs WHERE id = ?", id)
+                if (jobs.size == 0) {
+                    throw "Job não encontrado"
+                }
+            }
+            return rows
+        } finally {
+            db.close(conn)
+        }
+    }
+
     public List<Job> claim(String kind, Long now, Long leaseMillis) {
         this.validateKind(kind)
         if (now < 0 || now > 9223372036768375807L || leaseMillis < 1 || leaseMillis > 86400000L) {
@@ -115,8 +180,8 @@ class JobStore {
         try {
             db.execute(conn, "BEGIN IMMEDIATE")
             started = true
-            db.execute(conn, "UPDATE jobs SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END, lease_until = 0, last_error = 'Prazo de execução expirado' WHERE kind = ? AND status = 'running' AND lease_until <= ?", kind, now)
-            var rows = db.query<koflow.Job>(conn, "SELECT * FROM jobs WHERE kind = ? AND status = 'pending' ORDER BY seq LIMIT 1", kind)
+            this.recoverExpired(conn, kind, now)
+            var rows = db.query<koflow.Job>(conn, "SELECT * FROM jobs WHERE kind = ? AND status = 'pending' AND available_at <= ? ORDER BY seq LIMIT 1", kind, now)
             if (rows.size > 0) {
                 var id = rows.get(0).id
                 var changed = db.execute(conn, "UPDATE jobs SET status = 'running', attempts = attempts + 1, lease_until = ? WHERE id = ? AND status = 'pending'", now + leaseMillis, id)
@@ -124,6 +189,14 @@ class JobStore {
                     throw "Não foi possível conceder a execução do job"
                 }
                 rows = db.query<koflow.Job>(conn, "SELECT * FROM jobs WHERE id = ?", id)
+                var pending = db.query<koflow.TableCount>(conn, "SELECT count(*) AS count FROM job_attempts WHERE job_id = ? AND result = 'running'", id)
+                if (pending.get(0).count != 0) {
+                    throw "Job tem tentativa anterior ainda aberta no histórico"
+                }
+                var opened = db.execute(conn, "INSERT INTO job_attempts(job_id, attempt, started_at) VALUES (?, ?, ?)", id, rows.get(0).attempts, now)
+                if (opened != 1) {
+                    throw "Tentativa não foi registrada"
+                }
             }
             db.execute(conn, "COMMIT")
             committed = true
@@ -139,31 +212,129 @@ class JobStore {
         }
     }
 
-    public Bool succeed(Job job, Long now) {
-        if (now < 0) {
-            throw "Relógio inválido"
+    private void recoverExpired(String conn, String kind, Long now) {
+        var stale = db.query<koflow.Job>(conn, "SELECT * FROM jobs WHERE kind = ? AND status = 'running' AND lease_until <= ? ORDER BY seq", kind, now)
+        var index = 0
+        while (index < stale.size) {
+            var lost = stale.get(index)
+            var closed = db.execute(conn, "UPDATE job_attempts SET result = 'expired', finished_at = ?, error = 'Prazo de execução expirado' WHERE job_id = ? AND attempt = ? AND result = 'running'", now, lost.id, lost.attempts)
+            if (closed != 1) {
+                throw "Histórico incoerente com a concessão expirada"
+            }
+            var released = db.execute(conn, "UPDATE jobs SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END, lease_until = 0, last_error = 'Prazo de execução expirado' WHERE id = ? AND attempts = ? AND status = 'running'", lost.id, lost.attempts)
+            if (released != 1) {
+                throw "Concessão expirada não foi liberada"
+            }
+            index = index + 1
         }
+    }
+
+    public Bool succeed(Job job, Long now) {
+        this.validateClock(now)
         var conn = this.connect()
+        var started = false
+        var committed = false
+        var acknowledged = false
         try {
-            return db.execute(conn, "UPDATE jobs SET status = 'succeeded', lease_until = 0, last_error = '' WHERE id = ? AND attempts = ? AND status = 'running' AND lease_until > ?", job.id, job.attempts, now) == 1
+            db.execute(conn, "BEGIN IMMEDIATE")
+            started = true
+            var changed = db.execute(conn, "UPDATE jobs SET status = 'succeeded', lease_until = 0, last_error = '', available_at = 0 WHERE id = ? AND attempts = ? AND status = 'running' AND lease_until > ?", job.id, job.attempts, now)
+            if (changed == 1) {
+                var closed = db.execute(conn, "UPDATE job_attempts SET result = 'succeeded', finished_at = ?, error = '' WHERE job_id = ? AND attempt = ? AND result = 'running'", now, job.id, job.attempts)
+                if (closed != 1) {
+                    throw "Histórico incoerente com o estado do job"
+                }
+                acknowledged = true
+            }
+            db.execute(conn, "COMMIT")
+            committed = true
+            return acknowledged
         } finally {
-            db.close(conn)
+            try {
+                if (started && !committed) {
+                    db.execute(conn, "ROLLBACK")
+                }
+            } finally {
+                db.close(conn)
+            }
         }
     }
 
     public Bool fail(Job job, String error, Long now) {
-        if (now < 0) {
-            throw "Relógio inválido"
-        }
+        this.validateClock(now)
         var detail = error
         if (detail.length > 4096) {
             detail = detail.substring(0, 4096)
         }
         var conn = this.connect()
+        var started = false
+        var committed = false
+        var acknowledged = false
         try {
-            return db.execute(conn, "UPDATE jobs SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END, lease_until = 0, last_error = ? WHERE id = ? AND attempts = ? AND status = 'running' AND lease_until > ?", detail, job.id, job.attempts, now) == 1
+            db.execute(conn, "BEGIN IMMEDIATE")
+            started = true
+            var changed = db.execute(conn, "UPDATE jobs SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END, lease_until = 0, last_error = ? WHERE id = ? AND attempts = ? AND status = 'running' AND lease_until > ?", detail, job.id, job.attempts, now)
+            if (changed == 1) {
+                var closed = db.execute(conn, "UPDATE job_attempts SET result = 'failed', finished_at = ?, error = ? WHERE job_id = ? AND attempt = ? AND result = 'running'", now, detail, job.id, job.attempts)
+                if (closed != 1) {
+                    throw "Histórico incoerente com o estado do job"
+                }
+                var state = db.query<koflow.Job>(conn, "SELECT * FROM jobs WHERE id = ?", job.id).get(0)
+                if (state.status == "pending") {
+                    var delay = this.backoffFor(job.attempts)
+                    var next = now + delay + this.jitterFor(job.id, job.attempts, delay)
+                    var scheduled = db.execute(conn, "UPDATE jobs SET available_at = ? WHERE id = ? AND status = 'pending'", next, job.id)
+                    if (scheduled != 1) {
+                        throw "Reentrega do job não foi agendada"
+                    }
+                }
+                acknowledged = true
+            }
+            db.execute(conn, "COMMIT")
+            committed = true
+            return acknowledged
         } finally {
-            db.close(conn)
+            try {
+                if (started && !committed) {
+                    db.execute(conn, "ROLLBACK")
+                }
+            } finally {
+                db.close(conn)
+            }
+        }
+    }
+
+    private Long backoffFor(Int attempt) {
+        var delay = 1000L
+        var step = 1
+        while (step < attempt && delay < 3600000L) {
+            delay = delay * 2L
+            step = step + 1
+        }
+        if (delay > 3600000L) {
+            delay = 3600000L
+        }
+        return delay
+    }
+
+    private Long jitterFor(String id, Int attempt, Long delay) {
+        var ceiling = delay * 20L / 100L
+        if (ceiling < 1L) {
+            return 0L
+        }
+        var mixed = 17L
+        var index = 0
+        while (index < id.length) {
+            mixed = (mixed * 31L + id.charAt(index)) % 1000003L
+            index = index + 1
+        }
+        mixed = (mixed * 31L + attempt) % 1000003L
+        return mixed % (ceiling + 1L)
+    }
+
+    private void validateClock(Long now) {
+        if (now < 0 || now > 9223372036768375807L) {
+            throw "Relógio inválido"
         }
     }
 
