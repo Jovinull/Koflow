@@ -75,26 +75,44 @@ make demo
 instalação é manual, com a distribuição `windows-x86_64`, e os scripts são chamados
 diretamente pelo Bash. Execute tudo no **Git Bash**, a partir da raiz do repositório.
 
+A instalação roda em um subshell com `set -e`, e a configuração e a execução só acontecem
+se ele terminar bem: uma instalação malsucedida não passa a usar em silêncio um cache
+anterior. O subshell fica isolado de propósito — dentro de uma lista `&&` o `set -e` é
+ignorado, e a verificação deixaria de interromper a sequência. Os `export` ficam na sessão,
+não no subshell, para que você possa repetir `bash scripts/test.sh` depois sem
+reconfigurar nada.
+
 ```sh
 cache="$HOME/.cache/koflow"
-tmp="$(mktemp -d)"
-mkdir -p "$cache"
 base=https://github.com/KofLang/Kof4j/releases/download/kof-0.3.22-beta-windows-x86_64
-curl -fL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS"
-curl -fL -o "$tmp/kof-0.3.22-beta-windows-x86_64.zip" "$base/kof-0.3.22-beta-windows-x86_64.zip"
-(cd "$tmp" && sha256sum -c SHA256SUMS)
-unzip -q "$tmp/kof-0.3.22-beta-windows-x86_64.zip" -d "$cache"
 jdbc=https://repo.maven.apache.org/maven2/org/xerial/sqlite-jdbc/3.53.4.0
-curl -fL -o "$cache/sqlite-jdbc-3.53.4.0.jar" "$jdbc/sqlite-jdbc-3.53.4.0.jar"
-rm -rf "$tmp"
+jar_sha=bcb1f51e36f940867e83342f9efbf5968ac44a6bef4d397bb4af7b17b45cd2fb
 
-export KOF="$cache/kof-0.3.22-beta-windows-x86_64/bin/kof"
-export JAVA="$cache/kof-0.3.22-beta-windows-x86_64/jdk/bin/java"
-export SQLITE_JDBC="$cache/sqlite-jdbc-3.53.4.0.jar"
+(
+    set -e
+    tmp="$(mktemp -d)"
+    trap 'rm -rf -- "$tmp"' EXIT
+    mkdir -p "$cache"
+    curl -fL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS"
+    curl -fL -o "$tmp/kof-0.3.22-beta-windows-x86_64.zip" "$base/kof-0.3.22-beta-windows-x86_64.zip"
+    cd "$tmp"
+    sha256sum -c SHA256SUMS
+    curl -fL -o sqlite-jdbc-3.53.4.0.jar "$jdbc/sqlite-jdbc-3.53.4.0.jar"
+    printf '%s  %s\n' "$jar_sha" sqlite-jdbc-3.53.4.0.jar | sha256sum -c -
+    unzip -q kof-0.3.22-beta-windows-x86_64.zip -d "$cache"
+    mv sqlite-jdbc-3.53.4.0.jar "$cache/"
+)
+instalado=$?
 
-bash scripts/build.sh
-bash scripts/test.sh
-bash scripts/demo.sh
+if [ "$instalado" -eq 0 ]; then
+    export KOF="$cache/kof-0.3.22-beta-windows-x86_64/bin/kof"
+    export JAVA="$cache/kof-0.3.22-beta-windows-x86_64/jdk/bin/java"
+    export SQLITE_JDBC="$cache/sqlite-jdbc-3.53.4.0.jar"
+    bash scripts/build.sh && bash scripts/test.sh && bash scripts/demo.sh
+else
+    echo 'instalação falhou: nada foi configurado nem executado' >&2
+    (exit "$instalado")
+fi
 ```
 
 Instale o ripgrep antes dos testes, por exemplo com
