@@ -528,3 +528,202 @@ void rejectsInvalidWrites(String path) {
         db.close(conn)
     }
 }
+
+
+void createV2Schema(String conn) {
+    createLegacySchema(conn)
+    db.execute(conn, "ALTER TABLE jobs ADD COLUMN available_at INTEGER NOT NULL DEFAULT 0")
+    db.execute(conn, "CREATE TABLE job_attempts (seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, attempt INTEGER NOT NULL CHECK(attempt > 0), started_at INTEGER NOT NULL CHECK(started_at >= 0), finished_at INTEGER NOT NULL DEFAULT 0, result TEXT NOT NULL DEFAULT 'running' CHECK(result IN ('running','succeeded','failed','expired')), error TEXT NOT NULL DEFAULT '', UNIQUE(job_id, attempt), CHECK((result = 'running' AND finished_at = 0) OR (result <> 'running' AND finished_at >= 0)))")
+    db.execute(conn, "INSERT INTO job_attempts(job_id, attempt, started_at) SELECT id, attempts, 0 FROM jobs WHERE status = 'running'")
+    db.execute(conn, "INSERT INTO jobs(id, kind, payload, status, attempts, max_attempts, lease_until, last_error, available_at) VALUES ('antigo-concluido', 'legado', 'terminou antes da v3', 'succeeded', 1, 3, 0, '', 0)")
+    db.execute(conn, "PRAGMA user_version = 2")
+}
+
+void checkMigrationV2() {
+    var path = config.env("TEST_DB") + ".v2"
+    var legacy = db.connect("jdbc:sqlite:" + path)
+    try {
+        createV2Schema(legacy)
+    } finally {
+        db.close(legacy)
+    }
+    var migrado = JobStore(path)
+    assert(migrado.get("antigo-pendente").payload == "payload preservado")
+    assert(migrado.get("antigo-concluido").status == "succeeded")
+    assert(migrado.attempts("antigo-executando").size == 1, "histórico da v2 é preservado")
+    var conn = db.connect("jdbc:sqlite:" + path)
+    try {
+        assert(db.query<Version>(conn, "PRAGMA user_version").get(0).user_version == 3)
+        assert(db.query<Linhas>(conn, "SELECT count(*) AS total FROM jobs WHERE terminal_at IS NOT NULL").get(0).total == 0,
+            "nenhum instante terminal é inventado na migração")
+    } finally {
+        db.close(conn)
+    }
+    assert(migrado.purge("legado", 9999999L, 100) == 0, "terminal legado sem instante não é removível")
+    assert(migrado.get("antigo-concluido").status == "succeeded")
+    println("PASS migração v2 para v3 não inventa instante terminal")
+}
+
+void checkRetention(JobStore store) {
+    var concluido = store.enqueue("reter", "concluido", 2)
+    var falho = store.enqueue("reter", "falho", 1)
+    var pendente = store.enqueue("reter", "pendente", 2)
+    var emEspera = store.enqueueAt("reter", "agendado", 2, 90000L)
+
+    var primeiro = store.claim("reter", 30000L, 100L).get(0)
+    assert(primeiro.id == concluido)
+    assert(store.succeed(primeiro, 30001L))
+    var segundo = store.claim("reter", 30002L, 100L).get(0)
+    assert(segundo.id == falho)
+    assert(store.fail(segundo, "definitiva", 30003L))
+    assert(store.get(falho).status == "failed")
+
+    var vivo = store.claim("reter", 30004L, 86400000L).get(0)
+    assert(vivo.id == pendente)
+
+    assert(store.purge("reter", 30001L, 10) == 0, "fronteira estrita: instante igual não é anterior")
+    assert(store.purge("reter", 30002L, 10) == 1, "remove só o que ficou terminal antes do corte")
+    expectFailure(() -> { store.get(concluido); return true })
+    assert(store.attempts(falho).size == 1, "histórico de outro job permanece")
+    assert(store.get(falho).status == "failed")
+
+    assert(store.purge("reter", 99999999L, 10) == 1)
+    assert(store.get(pendente).status == "running", "job com concessão vigente nunca é removido")
+    assert(store.get(emEspera).status == "pending", "job aguardando instante futuro nunca é removido")
+    assert(store.purge("reter", 99999999L, 10) == 0, "nada mais é removível")
+    expectFailure(() -> { store.purge("reter", 99999999L, 0); return true })
+    expectFailure(() -> { store.purge("reter", 99999999L, 10001); return true })
+    expectFailure(() -> { store.purge(" ", 99999999L, 10); return true })
+    assert(store.purge("kind-inexistente", 99999999L, 10) == 0)
+    println("PASS retenção remove apenas terminais anteriores ao corte")
+}
+
+void checkRetentionLimit(JobStore store) {
+    var index = 0
+    var primeiro = ""
+    while (index < 5) {
+        var criado = store.enqueue("lote", "p", 2)
+        if (index == 0) {
+            primeiro = criado
+        }
+        var job = store.claim("lote", 40000L, 100L).get(0)
+        assert(store.succeed(job, 40001L))
+        assert(store.attempts(criado).size == 1)
+        index = index + 1
+    }
+    assert(store.purge("lote", 50000L, 2) == 2, "o limite é respeitado exatamente")
+    assert(store.purge("lote", 50000L, 2) == 2)
+    assert(store.purge("lote", 50000L, 2) == 1)
+    assert(store.purge("lote", 50000L, 2) == 0)
+    var conn = db.connect("jdbc:sqlite:" + config.env("TEST_DB"))
+    try {
+        assert(db.query<Linhas>(conn, "SELECT count(*) AS total FROM job_attempts WHERE job_id = ?", primeiro).get(0).total == 0,
+            "o histórico do job removido precisa sair junto")
+        assert(db.query<Linhas>(conn, "SELECT count(*) AS total FROM jobs WHERE kind = 'lote'").get(0).total == 0,
+            "nenhum job do lote pode sobrar")
+    } finally {
+        db.close(conn)
+    }
+    println("PASS retenção respeita o limite e leva o histórico junto")
+}
+
+void checkRetentionRollback(JobStore store) {
+    var id = store.enqueue("atomico", "p", 2)
+    var job = store.claim("atomico", 60000L, 100L).get(0)
+    assert(store.succeed(job, 60001L))
+    var conn = db.connect("jdbc:sqlite:" + config.env("TEST_DB"))
+    try {
+        db.execute(conn, "CREATE TRIGGER rejeita_remocao BEFORE DELETE ON jobs WHEN OLD.kind = 'atomico' BEGIN SELECT RAISE(ABORT, 'remocao rejeitada'); END")
+        expectFailure(() -> { store.purge("atomico", 70000L, 10); return true })
+        assert(store.get(id).status == "succeeded", "falha na remoção preserva o job")
+        assert(store.attempts(id).size == 1, "falha na remoção preserva o histórico")
+        db.execute(conn, "DROP TRIGGER rejeita_remocao")
+    } finally {
+        db.close(conn)
+    }
+    assert(store.purge("atomico", 70000L, 10) == 1)
+    println("PASS remoção é atômica entre job e histórico")
+}
+
+void checkInspection(JobStore store) {
+    var pronto = store.enqueue("inspecao", "pronto", 2)
+    var agendado = store.enqueueAt("inspecao", "agendado", 2, 80000L)
+    var executando = store.enqueue("inspecao", "executando", 2)
+    var ok = store.enqueue("inspecao", "ok", 2)
+    var ruim = store.enqueue("inspecao", "ruim", 1)
+
+    var emExecucao = store.claim("inspecao", 50000L, 86400000L).get(0)
+    assert(emExecucao.id == pronto, "o primeiro elegível é o mais antigo")
+    var jobOk = store.claim("inspecao", 50001L, 100L).get(0)
+    assert(jobOk.id == executando)
+    assert(store.succeed(jobOk, 50002L))
+    var jobRuim = store.claim("inspecao", 50003L, 100L).get(0)
+    assert(jobRuim.id == ok)
+    assert(store.fail(jobRuim, "primeira", 50004L))
+
+    var c = store.counts("inspecao", 50005L)
+    assert(c.running == 1, "o job com concessão vigente aparece como running")
+    assert(c.succeeded == 1)
+    assert(c.pending_scheduled == 2, "o agendado e o que espera reentrega")
+    assert(c.pending_ready == 1)
+
+    var depois = store.counts("inspecao", 999999L)
+    assert(depois.pending_scheduled == 0, "com o tempo, agendados passam a elegíveis")
+    assert(depois.pending_ready == 3)
+
+    var vazio = store.counts("kind-sem-nada", 50005L)
+    assert(vazio.pending_ready == 0 && vazio.running == 0 && vazio.failed == 0, "contagem zero é legível")
+
+    assert(store.list("inspecao", "running", 50005L, 10).size == 1)
+    assert(store.list("inspecao", "running", 50005L, 10).get(0).id == pronto)
+    assert(store.list("inspecao", "succeeded", 50005L, 10).get(0).id == executando)
+    assert(store.list("inspecao", "pending_scheduled", 50005L, 10).get(0).id == agendado)
+    assert(store.list("inspecao", "pending_ready", 50005L, 10).get(0).id == ruim)
+    assert(store.list("inspecao", "pending_ready", 999999L, 1).size == 1, "o limite é respeitado")
+    assert(store.list("outro-kind", "running", 50005L, 10).size == 0, "isolamento por kind")
+    expectFailure(() -> { store.list("inspecao", "categoria-errada", 50005L, 10); return true })
+    expectFailure(() -> { store.list("inspecao", "running", 50005L, 0); return true })
+
+    var antes = store.counts("inspecao", 50005L)
+    store.list("inspecao", "running", 50005L, 10)
+    var apos = store.counts("inspecao", 50005L)
+    assert(antes.running == apos.running, "inspeção não altera estado")
+    assert(antes.succeeded == apos.succeeded)
+    println("PASS inspeção distingue elegível, agendado, running e terminais")
+}
+
+void checkRetentionIgnoredHistory(JobStore store) {
+    var id = store.enqueue("purge-hist", "p", 2)
+    var job = store.claim("purge-hist", 65000L, 100L).get(0)
+    assert(store.succeed(job, 65001L))
+    var conn = db.connect("jdbc:sqlite:" + config.env("TEST_DB"))
+    try {
+        db.execute(conn, "CREATE TRIGGER ignora_delete_hist BEFORE DELETE ON job_attempts WHEN OLD.job_id = (SELECT id FROM jobs WHERE kind = 'purge-hist') BEGIN SELECT RAISE(IGNORE); END")
+        expectFailure(() -> { store.purge("purge-hist", 66000L, 10); return true })
+        assert(store.get(id).status == "succeeded", "job preservado quando o histórico não sai")
+        assert(store.attempts(id).size == 1, "histórico preservado")
+        db.execute(conn, "DROP TRIGGER ignora_delete_hist")
+    } finally {
+        db.close(conn)
+    }
+    assert(store.purge("purge-hist", 66000L, 10) == 1)
+    println("PASS remoção de histórico ignorada aborta a retenção")
+}
+
+void checkRetentionIgnoredJob(JobStore store) {
+    var id = store.enqueue("purge-job", "p", 2)
+    var job = store.claim("purge-job", 67000L, 100L).get(0)
+    assert(store.succeed(job, 67001L))
+    var conn = db.connect("jdbc:sqlite:" + config.env("TEST_DB"))
+    try {
+        db.execute(conn, "CREATE TRIGGER ignora_delete_job BEFORE DELETE ON jobs WHEN OLD.kind = 'purge-job' BEGIN SELECT RAISE(IGNORE); END")
+        expectFailure(() -> { store.purge("purge-job", 68000L, 10); return true })
+        assert(store.get(id).status == "succeeded", "job preservado")
+        assert(store.attempts(id).size == 1, "histórico não pode ser destruído sem o job sair")
+        db.execute(conn, "DROP TRIGGER ignora_delete_job")
+    } finally {
+        db.close(conn)
+    }
+    assert(store.purge("purge-job", 68000L, 10) == 1)
+    println("PASS remoção de job ignorada não destrói o histórico em silêncio")
+}
